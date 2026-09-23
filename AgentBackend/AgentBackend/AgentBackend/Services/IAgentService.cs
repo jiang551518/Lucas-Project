@@ -31,6 +31,8 @@ public interface IAgentService
     Task<IReadOnlyList<ProviderSummary>> GetProvidersAsync(CancellationToken cancellationToken = default);
     /// <summary>验证并安全保存 OpenAI-compatible Provider 及其模型列表。</summary>
     Task<ProviderSummary> SaveProviderAsync(SaveProviderRequest request, CancellationToken cancellationToken = default);
+    /// <summary>使用已保存的 DeepSeek API Key 查询账号余额。</summary>
+    Task<ProviderBalance> GetProviderBalanceAsync(string name, CancellationToken cancellationToken = default);
     /// <summary>删除本地保存的 Provider 配置及其模型列表。</summary>
     Task<bool> DeleteProviderProfileAsync(string name, CancellationToken cancellationToken = default);
     /// <summary>读取技能清单。</summary>

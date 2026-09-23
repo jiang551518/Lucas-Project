@@ -76,5 +76,11 @@ public sealed class StoredProviderProfile
 /// <summary>返回客户端的 Provider 信息，不包含 API Key 本身。</summary>
 public sealed record ProviderSummary(string Name, string BaseUrl, IReadOnlyList<string> Models, bool HasApiKey);
 
+/// <summary>DeepSeek API 账号的可用余额与按币种汇总明细。</summary>
+public sealed record ProviderBalance(bool IsAvailable, IReadOnlyList<ProviderBalanceInfo> BalanceInfos);
+
+/// <summary>单一币种的总余额、赠金余额与充值余额。</summary>
+public sealed record ProviderBalanceInfo(string Currency, string TotalBalance, string GrantedBalance, string ToppedUpBalance);
+
 /// <summary>用于保存或更新 Provider 配置的请求对象。</summary>
 public sealed record SaveProviderRequest(string Name, string? ExistingName, string BaseUrl, IReadOnlyList<string> Models, string? ApiKey);

@@ -57,10 +57,18 @@ button { border: 0; cursor: pointer; }
 .menu-caption { padding: 5px 8px 6px; color: #949b95; font-size: 11px; }
 .menu-empty { padding: 7px 8px; color: #979e98; font-size: 12px; }
 .chat-assignment-menu .unassign-action { margin-top: 4px; border-top: 1px solid #edf0ec; border-radius: 0 0 7px 7px; }
-.profile { margin-top: auto; display: flex; align-items: center; gap: 8px; width: 100%; padding: 9px 10px; color: #555b56; background: #eef3df; border-radius: 12px; text-align: left; }
-.profile:hover { background: #e4ecd5; }
-.avatar { display: inline-grid; place-items: center; width: 22px; height: 22px; color: #fff; background: #b74939; border-radius: 50%; font-size: 12px; }
-.profile-arrow { margin-left: auto; color: #8e968f; flex: none; }
+.sidebar-balance { margin-top: auto; padding: 10px; border: 1px solid #e4eade; border-radius: 12px; background: #eef3df; }
+.sidebar-balance-query { display: flex; align-items: center; justify-content: space-between; gap: 8px; width: 100%; padding: 0; color: #4d594e; background: transparent; text-align: left; }
+.sidebar-balance-title { font-size: 12px; font-weight: 600; }
+.sidebar-balance-action { color: #718071; font-size: 11px; white-space: nowrap; }
+.sidebar-balance-query:hover .sidebar-balance-action { color: #3987ee; }
+.sidebar-balance-query:disabled { cursor: wait; }
+.sidebar-balance-status { margin-top: 7px; color: #637b64; font-size: 10px; line-height: 1.5; }
+.sidebar-balance-status.unavailable, .sidebar-balance-error { color: #ad5146; }
+.sidebar-balance-amount { display: grid; gap: 3px; margin-top: 7px; padding-top: 7px; border-top: 1px solid #dfe6d9; color: #465247; }
+.sidebar-balance-amount strong { font-size: 12px; }
+.sidebar-balance-amount small { color: #7a8579; font-size: 10px; }
+.sidebar-balance-error { margin-top: 7px; overflow-wrap: anywhere; font-size: 10px; line-height: 1.45; }
 
 .main-panel { flex: 1; display: flex; flex-direction: column; width: 0; height: 100vh; min-width: 0; min-height: 0; overflow: hidden; }
 .workspace-error { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 10px 20px 0; padding: 9px 12px; color: #8b3f33; background: #fff3ef; border: 1px solid #f3d5cd; border-radius: 9px; font-size: 12px; }
@@ -69,6 +77,8 @@ button { border: 0; cursor: pointer; }
 .window-title { position: absolute; left: 50%; max-width: 50%; overflow: hidden; font-weight: 650; text-overflow: ellipsis; white-space: nowrap; transform: translateX(-50%); }
 .top-actions { display: flex; gap: 20px; color: #777c79; font-size: 14px; }
 .conversation { flex: 1; width: min(900px, calc(100% - 48px)); min-height: 0; margin: 0 auto; padding: 46px 0 180px; overflow-x: hidden; overflow-y: auto; }
+.scroll-bottom-button { position: fixed; z-index: 5; left: calc(138px + 50vw); bottom: 160px; display: grid; place-items: center; width: 44px; height: 44px; padding: 0; color: #5b735e; border: 1px solid #e2e8e0; border-radius: 50%; background: rgba(255, 255, 255, .96); box-shadow: 0 5px 18px rgba(36, 44, 37, .14); transform: translateX(-50%); transition: color .15s ease, background .15s ease, box-shadow .15s ease; }
+.scroll-bottom-button:hover { color: #fff; background: #3987ee; border-color: #3987ee; box-shadow: 0 7px 20px rgba(57, 135, 238, .24); }
 .landing-page { flex: 1; min-height: 0; display: grid; place-items: center; padding: 24px 24px 150px; overflow-y: auto; }
 .landing-content { margin-top: -60px; text-align: center; }
 .landing-icon { width: 46px; height: 46px; display: grid; place-items: center; margin: 0 auto 18px; color: #627864; background: #eef4ec; border-radius: 15px; }
@@ -200,6 +210,13 @@ button { border: 0; cursor: pointer; }
 .model-input-row input { flex: 1; min-width: 0; }
 .model-input-row > button { width: 32px; height: 32px; display: grid; place-items: center; border-radius: 8px; color: #ad5c50; background: #fff3f0; }
 .secret-note { margin: 13px 0; color: #929a93; font-size: 11px; line-height: 1.55; }
+.provider-balance-panel { margin-top: 15px; padding: 12px; border: 1px solid #e7ebe6; border-radius: 11px; background: #f8faf7; }
+.provider-balance-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; color: #434d45; font-size: 12px; }
+.provider-balance-panel .secret-note { margin: 8px 0 0; }
+.provider-balance-status { margin: 10px 0 4px; color: #54735a; font-size: 12px; }
+.provider-balance-row { display: flex; justify-content: space-between; gap: 12px; padding: 8px 0; border-top: 1px solid #e8ece7; color: #59635b; font-size: 12px; }
+.provider-balance-row strong { color: #303a32; }
+.provider-balance-error { margin: 9px 0 0; color: #b34e40; font-size: 11px; overflow-wrap: anywhere; }
 .dialog-actions { display: flex; justify-content: flex-end; gap: 9px; margin-top: 18px; }
 .dialog-actions button { min-height: 36px; padding: 0 14px; border-radius: 9px; font-size: 13px; }
 .cancel-button { color: #606961; background: #f1f3f0; }

@@ -54,7 +54,10 @@ export const getProviders = () => request<ProviderSummary[]>('/api/providers')
 export const saveProvider = (provider: SaveProviderRequest) => request<ProviderSummary>('/api/providers', { method: 'PUT', body: JSON.stringify(provider) })
 /** 删除用户添加的 Provider 配置及其全部模型。 */
 export const deleteProvider = (name: string) => request<void>(`/api/providers/${encodeURIComponent(name)}`, { method: 'DELETE' })
+/** 查询已保存的 DeepSeek 服务商账号余额。 */
+export const getProviderBalance = (name: string) => request<ProviderBalance>(`/api/providers/${encodeURIComponent(name)}/balance`)
 export type ProviderSummary = { name: string; baseUrl: string; models: string[]; hasApiKey: boolean }
+export type ProviderBalance = { isAvailable: boolean; balanceInfos: { currency: string; totalBalance: string; grantedBalance: string; toppedUpBalance: string }[] }
 export type SaveProviderRequest = { name: string; existingName: string | null; baseUrl: string; models: string[]; apiKey: string }
 export type AgentSkill = { id: string; name: string; description: string; instructions: string; enabled: boolean; updatedAt: string }
 export type MemoryEntry = { id: string; title: string; content: string; enabled: boolean; updatedAt: string }

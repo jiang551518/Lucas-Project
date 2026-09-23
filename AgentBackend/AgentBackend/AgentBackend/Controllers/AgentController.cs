@@ -27,6 +27,17 @@ public sealed class AgentController : ControllerBase
         catch (ArgumentException exception) { return BadRequest(new { error = exception.Message }); }
     }
 
+    /// <summary>查询 DeepSeek 配置对应账号的当前余额。</summary>
+    [HttpGet("providers/{name}/balance")]
+    public async Task<ActionResult<ProviderBalance>> GetProviderBalance(string name, CancellationToken cancellationToken)
+    {
+        try { return Ok(await _agentService.GetProviderBalanceAsync(name, cancellationToken)); }
+        catch (KeyNotFoundException exception) { return NotFound(new { error = exception.Message }); }
+        catch (NotSupportedException exception) { return BadRequest(new { error = exception.Message }); }
+        catch (InvalidOperationException exception) { return BadRequest(new { error = exception.Message }); }
+        catch (HttpRequestException exception) { return StatusCode(StatusCodes.Status502BadGateway, new { error = exception.Message }); }
+    }
+
     /// <summary>删除用户添加的 Provider 配置和其下全部模型。</summary>
     [HttpDelete("providers/{name}")]
     public async Task<IActionResult> DeleteProvider(string name, CancellationToken cancellationToken)

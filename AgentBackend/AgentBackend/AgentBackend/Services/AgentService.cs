@@ -137,6 +137,50 @@ public sealed class AgentService : IAgentService
         return new ProviderSummary(profile.Name, profile.BaseUrl, models, !string.IsNullOrWhiteSpace(profile.ProtectedApiKey));
     }
 
+    /// <summary>调用 DeepSeek 的 /user/balance 端点并返回账号余额，不向客户端暴露 API Key。</summary>
+    public async Task<ProviderBalance> GetProviderBalanceAsync(string name, CancellationToken cancellationToken = default)
+    {
+        var profiles = await _repository.GetProviderProfilesAsync(cancellationToken);
+        var profile = profiles.FirstOrDefault(item => item.Name.Equals(name, StringComparison.OrdinalIgnoreCase))
+            ?? throw new KeyNotFoundException("找不到该服务商配置");
+        if (!Uri.TryCreate(profile.BaseUrl, UriKind.Absolute, out var baseUri) ||
+            !baseUri.Host.Equals("api.deepseek.com", StringComparison.OrdinalIgnoreCase))
+            throw new NotSupportedException("余额查询目前仅支持 Base URL 为 api.deepseek.com 的 DeepSeek 配置");
+        if (string.IsNullOrWhiteSpace(profile.ProtectedApiKey))
+            throw new InvalidOperationException("该服务商尚未保存 API Key");
+
+        var apiKey = _providerKeyProtector.Unprotect(profile.ProtectedApiKey);
+        var balanceUri = new UriBuilder(baseUri) { Path = "/user/balance", Query = string.Empty, Fragment = string.Empty }.Uri;
+        using var request = new HttpRequestMessage(HttpMethod.Get, balanceUri);
+        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", apiKey);
+        using var response = await _httpClientFactory.CreateClient("ModelProvider").SendAsync(request, cancellationToken);
+        if (!response.IsSuccessStatusCode)
+        {
+            var message = response.StatusCode == System.Net.HttpStatusCode.Unauthorized
+                ? "DeepSeek 拒绝了该 API Key，请检查密钥是否有效。"
+                : $"DeepSeek 余额查询失败（HTTP {(int)response.StatusCode}）。";
+            throw new HttpRequestException(message, null, response.StatusCode);
+        }
+
+        await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
+        using var document = await JsonDocument.ParseAsync(stream, cancellationToken: cancellationToken);
+        var root = document.RootElement;
+        var isAvailable = root.TryGetProperty("is_available", out var available) && available.ValueKind == JsonValueKind.True;
+        var balances = new List<ProviderBalanceInfo>();
+        if (root.TryGetProperty("balance_infos", out var balanceInfos) && balanceInfos.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var balance in balanceInfos.EnumerateArray())
+            {
+                balances.Add(new ProviderBalanceInfo(
+                    ReadString(balance, "currency"),
+                    ReadString(balance, "total_balance"),
+                    ReadString(balance, "granted_balance"),
+                    ReadString(balance, "topped_up_balance")));
+            }
+        }
+        return new ProviderBalance(isAvailable, balances);
+    }
+
     /// <summary>删除用户保存的 Provider 配置及关联的模型清单。</summary>
     public Task<bool> DeleteProviderProfileAsync(string name, CancellationToken cancellationToken = default) => _repository.DeleteProviderProfileAsync(name, cancellationToken);
 
@@ -187,6 +231,8 @@ public sealed class AgentService : IAgentService
         var session = await _repository.GetSessionAsync(sessionId, cancellationToken)
             ?? throw new KeyNotFoundException("会话不存在");
         if (string.IsNullOrWhiteSpace(prompt)) throw new ArgumentException("提示内容不能为空", nameof(prompt));
+        var previousInputTokens = session.Messages.Where(message => message.Role == "assistant").Sum(message => message.InputTokens ?? 0);
+        var previousOutputTokens = session.Messages.Where(message => message.Role == "assistant").Sum(message => message.OutputTokens ?? 0);
 
         var userMessage = new AgentMessage { Role = "user", Content = prompt.Trim() };
         var assistantMessage = new AgentMessage { Role = "assistant", Content = string.Empty };
@@ -211,14 +257,14 @@ public sealed class AgentService : IAgentService
             var demoOutputTokens = EstimateTokens(assistantMessage.Content);
             assistantMessage.ElapsedMilliseconds = stopwatch.ElapsedMilliseconds;
             await _repository.UpdateUsageAsync(assistantMessage.Id, demoInputTokens, demoOutputTokens, assistantMessage.ElapsedMilliseconds.Value, null, cancellationToken);
-            yield return AgentEvent.UsageUpdate(runId, new UsageSnapshot(demoInputTokens, demoOutputTokens, demoInputTokens + demoOutputTokens, true));
+            yield return AgentEvent.UsageUpdate(runId, new UsageSnapshot(previousInputTokens + demoInputTokens, previousOutputTokens + demoOutputTokens, previousInputTokens + previousOutputTokens + demoInputTokens + demoOutputTokens, true));
             yield return AgentEvent.Completed(runId, stopwatch.ElapsedMilliseconds);
             yield break;
         }
 
         var inputTokens = 0;
         var outputTokens = 0;
-        var hasProviderUsage = false;
+        var hasEstimatedUsage = false;
         var enabledSkills = (await _repository.GetSkillsAsync(cancellationToken)).Where(skill => skill.Enabled).ToArray();
         var enabledMemories = (await _repository.GetMemoriesAsync(cancellationToken)).Where(memory => memory.Enabled).ToArray();
         var contextParts = new List<string>();
@@ -259,6 +305,9 @@ public sealed class AgentService : IAgentService
             var providerReasoningContent = new StringBuilder();
             var unsupportedProtocolInContent = false;
             var unsupportedContentHidden = false;
+            var requestInputTokens = 0;
+            var requestOutputTokens = 0;
+            var requestHasProviderUsage = false;
             using var request = BuildRequest(provider, messages, workspaceRoot is null || iteration == 9 ? null : CreateToolDefinitions());
             using var response = await _httpClientFactory.CreateClient("ModelProvider").SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
             if (!response.IsSuccessStatusCode)
@@ -282,10 +331,21 @@ public sealed class AgentService : IAgentService
                     var root = json.RootElement;
                     if (root.TryGetProperty("usage", out var usageElement) && usageElement.ValueKind == JsonValueKind.Object)
                     {
-                        inputTokens += ReadInt(usageElement, "prompt_tokens");
-                        outputTokens += ReadInt(usageElement, "completion_tokens");
-                        hasProviderUsage |= inputTokens > 0 || outputTokens > 0;
-                        yield return AgentEvent.UsageUpdate(runId, new UsageSnapshot(inputTokens, outputTokens, inputTokens + outputTokens, !hasProviderUsage));
+                        var reportedInputTokens = ReadInt(usageElement, "prompt_tokens");
+                        var reportedOutputTokens = ReadInt(usageElement, "completion_tokens");
+                        if (reportedInputTokens > 0 || reportedOutputTokens > 0)
+                        {
+                            // Streaming providers may send multiple cumulative usage snapshots; keep the latest
+                            // value for this HTTP request and add it only once after the stream ends.
+                            requestInputTokens = reportedInputTokens;
+                            requestOutputTokens = reportedOutputTokens;
+                            requestHasProviderUsage = true;
+                            yield return AgentEvent.UsageUpdate(runId, new UsageSnapshot(
+                                previousInputTokens + inputTokens + requestInputTokens,
+                                previousOutputTokens + outputTokens + requestOutputTokens,
+                                previousInputTokens + previousOutputTokens + inputTokens + outputTokens + requestInputTokens + requestOutputTokens,
+                                hasEstimatedUsage));
+                        }
                     }
                     if (!root.TryGetProperty("choices", out var choices) || choices.GetArrayLength() == 0) continue;
                     var delta = choices[0].TryGetProperty("delta", out var deltaElement) ? deltaElement : default;
@@ -314,16 +374,15 @@ public sealed class AgentService : IAgentService
                     }
                     if (TryReadText(delta, "content", out var content))
                     {
+                        assistantContent.Append(content);
                         if (!unsupportedContentHidden)
                         {
-                            assistantContent.Append(content);
                             assistantMessage.Content += content;
                             yield return AgentEvent.Message(runId, content);
                             if (ContainsUnsupportedToolProtocol(assistantContent.ToString()))
                             {
                                 unsupportedProtocolInContent = true;
                                 unsupportedContentHidden = true;
-                                assistantContent.Clear();
                                 assistantMessage.Content = assistantMessage.Content[..contentLengthBeforeIteration];
                                 yield return AgentEvent.ReplaceMessage(runId, assistantMessage.Content);
                             }
@@ -346,20 +405,39 @@ public sealed class AgentService : IAgentService
                     }
                 }
             }
+            if (requestHasProviderUsage)
+            {
+                inputTokens += requestInputTokens;
+                outputTokens += requestOutputTokens;
+            }
+            else
+            {
+                hasEstimatedUsage = true;
+                inputTokens += EstimateTokens(messages.ToJsonString());
+                outputTokens += EstimateTokens(assistantContent.ToString() + assistantReasoning + string.Join("", toolCalls.Values.Select(call => call["function"]?["arguments"]?.GetValue<string>() ?? string.Empty)));
+            }
             if (unsupportedProtocolInContent || ContainsUnsupportedToolProtocol(assistantContent.ToString()))
             {
-                // A provider/model emitted its private tool DSL as user-facing text. Retract
-                // already streamed chunks and never execute instructions found in that text.
-                assistantMessage.Content = assistantMessage.Content[..contentLengthBeforeIteration];
-                assistantContent.Clear();
-                if (toolCalls.Count == 0)
+                // DeepSeek models can expose their documented DSML tool-call envelope as content
+                // instead of structured OpenAI tool_calls. Parse only complete, allow-listed calls.
+                if (TryParseDeepSeekDsml(assistantContent.ToString(), toolCalls, out var visibleText))
                 {
+                    assistantMessage.Content = assistantMessage.Content[..contentLengthBeforeIteration] + visibleText;
+                    yield return AgentEvent.ReplaceMessage(runId, assistantMessage.Content);
+                }
+                else if (toolCalls.Count == 0)
+                {
+                    // Unknown or malformed protocols are never treated as executable commands.
                     const string compatibilityNotice = "当前模型返回了不兼容的工具调用格式，本次没有执行其中的命令。请改用支持标准 function calling（tool_calls）的模型或服务商后重试。";
                     assistantMessage.Content = compatibilityNotice;
                     yield return AgentEvent.ReplaceMessage(runId, compatibilityNotice);
                     break;
                 }
-                yield return AgentEvent.ReplaceMessage(runId, assistantMessage.Content);
+                else
+                {
+                    assistantMessage.Content = assistantMessage.Content[..contentLengthBeforeIteration];
+                    yield return AgentEvent.ReplaceMessage(runId, assistantMessage.Content);
+                }
             }
             if (toolCalls.Count == 0) break;
             foreach (var call in toolCalls.Values)
@@ -411,17 +489,11 @@ public sealed class AgentService : IAgentService
         }
 
         await _repository.AddMessageAsync(sessionId, assistantMessage, cancellationToken);
-        var estimated = !hasProviderUsage;
-        if (estimated)
-        {
-            inputTokens = EstimateTokens(string.Join("\n", session.Messages.Select(message => message.Content).Append(prompt)));
-            outputTokens = EstimateTokens(assistantMessage.Content);
-        }
         var gitDiff = workspaceRoot is null ? null : await _gitChangeTracker.GetDiffAsync(gitSnapshot, workspaceRoot, cancellationToken);
         if (gitDiff is not null) yield return AgentEvent.GitDiff(runId, gitDiff);
         assistantMessage.ElapsedMilliseconds = stopwatch.ElapsedMilliseconds;
         await _repository.UpdateUsageAsync(assistantMessage.Id, inputTokens, outputTokens, assistantMessage.ElapsedMilliseconds.Value, gitDiff, cancellationToken);
-        yield return AgentEvent.UsageUpdate(runId, new UsageSnapshot(inputTokens, outputTokens, inputTokens + outputTokens, estimated));
+        yield return AgentEvent.UsageUpdate(runId, new UsageSnapshot(previousInputTokens + inputTokens, previousOutputTokens + outputTokens, previousInputTokens + previousOutputTokens + inputTokens + outputTokens, hasEstimatedUsage));
         yield return AgentEvent.Completed(runId, stopwatch.ElapsedMilliseconds);
     }
 
@@ -532,8 +604,72 @@ public sealed class AgentService : IAgentService
             .Replace('＞', '>');
         return Regex.IsMatch(
             normalized,
-            @"<\|+(?:DSML|DMSL)\|+(?:CALLS|FUNCTION_CALLS|INVOKE)\b",
+            @"<\|+(?:DSML|DMSL)\|+(?:CALLS|FUNCTION_CALLS|TOOL_CALLS|INVOKE)\b",
             RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+    }
+
+    /// <summary>把 DeepSeek DSML 内容中的完整工具调用转换为内部 OpenAI tool_calls 结构。</summary>
+    private static bool TryParseDeepSeekDsml(string content, SortedDictionary<int, JsonObject> toolCalls, out string visibleText)
+    {
+        var normalized = content.Replace('｜', '|').Replace('＜', '<').Replace('＞', '>');
+        var block = Regex.Match(normalized,
+            @"<\|+DSML\|+(?:function_calls|tool_calls|toolcalls)\s*>(?<body>.*?)</\|+DSML\|+(?:function_calls|tool_calls|toolcalls)\s*>",
+            RegexOptions.IgnoreCase | RegexOptions.Singleline | RegexOptions.CultureInvariant);
+        visibleText = normalized;
+        if (!block.Success) return false;
+
+        var parsedCalls = new List<JsonObject>();
+        var invokeMatches = Regex.Matches(block.Groups["body"].Value,
+            @"<\|+DSML\|+invoke\s+name=""(?<name>[^""]+)""\s*>(?<parameters>.*?)</\|+DSML\|+invoke\s*>",
+            RegexOptions.IgnoreCase | RegexOptions.Singleline | RegexOptions.CultureInvariant);
+        if (invokeMatches.Count == 0) return false;
+
+        var allowedTools = new HashSet<string>(["list_files", "read_file", "write_file", "run_command"], StringComparer.Ordinal);
+        var body = block.Groups["body"].Value;
+        var nextBodyIndex = 0;
+        foreach (Match invoke in invokeMatches)
+        {
+            if (!string.IsNullOrWhiteSpace(body[nextBodyIndex..invoke.Index])) return false;
+            nextBodyIndex = invoke.Index + invoke.Length;
+            var name = invoke.Groups["name"].Value.Trim();
+            if (!allowedTools.Contains(name)) return false;
+            var arguments = new JsonObject();
+            var parameterText = invoke.Groups["parameters"].Value;
+            var parameterMatches = Regex.Matches(parameterText,
+                @"<\|+DSML\|+parameter\s+name=""(?<name>[^""]+)""\s+string=""(?<string>true|false)""\s*>(?<value>.*?)</\|+DSML\|+parameter\s*>",
+                RegexOptions.IgnoreCase | RegexOptions.Singleline | RegexOptions.CultureInvariant);
+            if (parameterMatches.Count != Regex.Matches(parameterText, @"<\|+DSML\|+parameter\b", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant).Count)
+                return false;
+            foreach (Match parameter in parameterMatches)
+            {
+                var parameterName = parameter.Groups["name"].Value;
+                var rawValue = parameter.Groups["value"].Value.Trim();
+                if (arguments.ContainsKey(parameterName)) return false;
+                try
+                {
+                    arguments[parameterName] = parameter.Groups["string"].Value.Equals("true", StringComparison.OrdinalIgnoreCase)
+                        ? JsonValue.Create(rawValue)
+                        : JsonNode.Parse(rawValue);
+                }
+                catch (JsonException)
+                {
+                    return false;
+                }
+            }
+            parsedCalls.Add(new JsonObject
+            {
+                ["id"] = Guid.NewGuid().ToString("N"),
+                ["type"] = "function",
+                ["function"] = new JsonObject { ["name"] = name, ["arguments"] = arguments.ToJsonString() }
+            });
+        }
+
+        if (!string.IsNullOrWhiteSpace(body[nextBodyIndex..]) ||
+            invokeMatches.Count != Regex.Matches(body, @"<\|+DSML\|+invoke\b", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant).Count)
+            return false;
+        foreach (var call in parsedCalls) toolCalls[toolCalls.Count] = call;
+        visibleText = content.Remove(block.Index, block.Length).Trim();
+        return true;
     }
 
     /// <summary>按工具类型生成审批弹窗中展示的动作摘要及真实工作目录。</summary>
@@ -600,6 +736,10 @@ public sealed class AgentService : IAgentService
 
     /// <summary>读取 JSON 对象中的整数 Token 统计，缺失时返回零。</summary>
     private static int ReadInt(JsonElement element, string propertyName) => element.TryGetProperty(propertyName, out var value) && value.TryGetInt32(out var result) ? result : 0;
+
+    /// <summary>读取 JSON 字符串属性；缺失或格式不符时返回空字符串。</summary>
+    private static string ReadString(JsonElement element, string propertyName) =>
+        element.TryGetProperty(propertyName, out var value) && value.ValueKind == JsonValueKind.String ? value.GetString() ?? string.Empty : string.Empty;
 
     /// <summary>读取增量字段中的字符串内容。</summary>
     private static bool TryReadText(JsonElement element, string propertyName, out string text)

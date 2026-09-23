@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, onUpdated, ref } from 'vue'
 import { marked } from 'marked'
 import DOMPurify from 'dompurify'
 import { isTauri } from '@tauri-apps/api/core'
@@ -10,7 +10,7 @@ import {
   IconMaximize, IconMessagePlus, IconMinimize, IconPencil, IconPlus, IconSearch, IconSettings, IconSparkles, IconTrash, IconX,
 } from '@tabler/icons-vue'
 import { pauseOrStopAgentRun, respondToApproval, startAgentRun, type AgentEvent } from './services/agent'
-import { createProject as createProjectRequest, createSession, deleteProject as deleteProjectRequest, deleteProvider, deleteSession, deleteSkill, deleteMemory, getProjects, getProviders, getSessions, getSkills, getMemories, getSettings, renameProject as renameProjectRequest, renameSession as renameSessionRequest, saveProvider, saveSkill, saveMemory, saveSettings as saveSettingsRequest, updateExecutionContext, type AgentSkill, type AgentSettings, type MemoryEntry, type ProviderSummary, type WorkspaceProject, type WorkspaceSession } from './services/workspace'
+import { createProject as createProjectRequest, createSession, deleteProject as deleteProjectRequest, deleteProvider, deleteSession, deleteSkill, deleteMemory, getProjects, getProviders, getProviderBalance, getSessions, getSkills, getMemories, getSettings, renameProject as renameProjectRequest, renameSession as renameSessionRequest, saveProvider, saveSkill, saveMemory, saveSettings as saveSettingsRequest, updateExecutionContext, type AgentSkill, type AgentSettings, type MemoryEntry, type ProviderBalance, type ProviderSummary, type WorkspaceProject, type WorkspaceSession } from './services/workspace'
 
 type Chat = WorkspaceSession & { updatedAt: string; messages: (WorkspaceSession['messages'][number] & { elapsedMilliseconds?: number; startedAtMs?: number; toolStatus?: string; showGitDiff?: boolean })[] }
 type Project = WorkspaceProject & { expanded: boolean }
@@ -60,7 +60,15 @@ const showProviderSettings = ref(false)
 const providerSaving = ref(false)
 const providerDraft = ref({ existingName: '', name: '', baseUrl: '', models: [''], apiKey: '' })
 const providerHasKey = ref(false)
+const providerBalance = ref<ProviderBalance | null>(null)
+const providerBalanceError = ref('')
+const providerBalanceLoading = ref(false)
+const providerBalanceName = ref('')
 const activeChat = computed(() => chats.value.find(chat => chat.id === activeChatId.value))
+const sidebarBalanceProvider = computed(() =>
+  providers.value.find(provider => provider.name === selectedProviderName.value && provider.hasApiKey && isDeepSeekBaseUrl(provider.baseUrl))
+  ?? providers.value.find(provider => provider.hasApiKey && isDeepSeekBaseUrl(provider.baseUrl))
+)
 const unassignedChats = computed(() => chats.value.filter(chat => !chat.projectId).sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt)))
 const visibleProject = computed(() => {
   const projectId = activeChat.value ? activeChat.value.projectId : selectedWorkspaceProjectId.value
@@ -72,6 +80,9 @@ const showSearch = ref(false)
 const searchText = ref('')
 const searchInput = ref<HTMLInputElement | null>(null)
 const isFullscreen = ref(false)
+const conversationElement = ref<HTMLElement | null>(null)
+const showScrollToBottom = ref(false)
+let scrollVisibilityFrame: number | undefined
 
 onMounted(async () => {
   document.addEventListener('click', handleOutsideMenuClick)
@@ -93,8 +104,28 @@ onMounted(async () => {
     if (initialChat) openChat(initialChat)
   } catch (error) { workspaceError.value = `无法连接后端：${String(error)}` }
 })
-onBeforeUnmount(() => { document.removeEventListener('click', handleOutsideMenuClick); document.removeEventListener('fullscreenchange', syncFullscreenState); if (runtimeTimer) clearInterval(runtimeTimer) })
+onUpdated(scheduleScrollVisibilityUpdate)
+onBeforeUnmount(() => { document.removeEventListener('click', handleOutsideMenuClick); document.removeEventListener('fullscreenchange', syncFullscreenState); if (runtimeTimer) clearInterval(runtimeTimer); if (scrollVisibilityFrame !== undefined) cancelAnimationFrame(scrollVisibilityFrame) })
 let runtimeTimer: ReturnType<typeof setInterval> | undefined
+
+function updateScrollToBottomVisibility() {
+  const element = conversationElement.value
+  if (!element) { showScrollToBottom.value = false; return }
+  const remaining = element.scrollHeight - element.scrollTop - element.clientHeight
+  showScrollToBottom.value = element.scrollHeight > element.clientHeight + 32 && remaining > 80
+}
+function scheduleScrollVisibilityUpdate() {
+  if (scrollVisibilityFrame !== undefined) cancelAnimationFrame(scrollVisibilityFrame)
+  scrollVisibilityFrame = requestAnimationFrame(() => {
+    scrollVisibilityFrame = undefined
+    updateScrollToBottomVisibility()
+  })
+}
+function scrollConversationToBottom() {
+  const element = conversationElement.value
+  if (!element) return
+  element.scrollTo({ top: element.scrollHeight, behavior: 'smooth' })
+}
 
 function formatDuration(milliseconds: number) {
   const totalSeconds = Math.max(0, Math.floor(milliseconds / 1000))
@@ -227,8 +258,18 @@ function openChat(chat: Chat) {
   selectedWorkspacePath.value = project?.workspacePath || chat.workspacePath || ''
   selectedWorkspacePathType.value = project?.workspacePathType || chat.workspacePathType || 'directory'
   permissionMode.value = chat.permissionMode === 'fullAccess' ? 'fullAccess' : 'approval'
+  usage.value = getSessionUsage(chat)
   workspaceMenuOpen.value = false
   permissionMenuOpen.value = false
+}
+function getSessionUsage(chat: Chat) {
+  const assistantMessages = chat.messages.filter(message => message.role === 'assistant')
+  return {
+    inputTokens: assistantMessages.reduce((total, message) => total + (message.inputTokens ?? 0), 0),
+    outputTokens: assistantMessages.reduce((total, message) => total + (message.outputTokens ?? 0), 0),
+    // Older databases do not record whether a stored turn's count was estimated.
+    estimated: assistantMessages.some(message => (message.inputTokens ?? 0) > 0 || (message.outputTokens ?? 0) > 0),
+  }
 }
 function setProjectWorkspace(project: Project | null) {
   selectedWorkspaceProjectId.value = project?.id ?? null
@@ -446,6 +487,19 @@ function addProviderConfiguration() {
   showProviderSettings.value = true
   showModelMenu.value = false
 }
+function isDeepSeekBaseUrl(value: string) {
+  try { return new URL(value).hostname.toLowerCase() === 'api.deepseek.com' } catch { return false }
+}
+async function queryProviderBalance(name = providerDraft.value.existingName) {
+  if (!name || providerBalanceLoading.value) return
+  providerBalanceLoading.value = true
+  providerBalanceError.value = ''
+  providerBalance.value = null
+  providerBalanceName.value = name
+  try { providerBalance.value = await getProviderBalance(name) }
+  catch (error) { providerBalanceError.value = String(error) }
+  finally { providerBalanceLoading.value = false }
+}
 function addModelField() { providerDraft.value.models.push('') }
 function removeModelField(index: number) {
   if (providerDraft.value.models.length > 1) providerDraft.value.models.splice(index, 1)
@@ -487,12 +541,13 @@ async function sendMessage() {
   }
   const chat = activeChat.value ?? await createChat()
   if (!chat) return
+  const previousUsage = getSessionUsage(chat)
   chat.messages.push({ id: crypto.randomUUID(), createdAt: new Date().toISOString(), role: 'user', content: text })
   if (chat.title === '新对话') chat.title = text.slice(0, 34)
   prompt.value = ''
   const assistant: Chat['messages'][number] = { id: crypto.randomUUID(), createdAt: new Date().toISOString(), role: 'assistant', content: '', reasoning: '', startedAtMs: Date.now(), toolStatus: '' }
   chat.messages.push(assistant)
-  usage.value = { inputTokens: Math.max(1, Math.ceil(text.length * 0.65)), outputTokens: 0, estimated: true }
+  usage.value = { inputTokens: previousUsage.inputTokens + Math.max(1, Math.ceil(text.length * 0.65)), outputTokens: previousUsage.outputTokens, estimated: true }
   let hidingUnsupportedToolText = false
   let hidingUnsupportedToolReasoning = false
   isRunning.value = true
@@ -526,19 +581,23 @@ async function sendMessage() {
           hidingUnsupportedToolText = true
           assistant.content = '检测到模型把内部工具协议当作正文输出，已隐藏这段内容。若没有后续回答，请改用支持标准 function calling 的模型或服务商后重试。'
           assistant.toolStatus = '已拦截非标准工具调用文本'
-          usage.value.outputTokens = Math.max(1, Math.ceil(assistant.content.length * 0.65))
+          usage.value.outputTokens = previousUsage.outputTokens + Math.max(1, Math.ceil(assistant.content.length * 0.65))
           return
         }
         assistant.content = nextContent
         assistant.toolStatus = '正在生成回答…'
-        usage.value.outputTokens = Math.max(1, Math.ceil(assistant.content.length * 0.65))
+        usage.value.outputTokens = previousUsage.outputTokens + Math.max(1, Math.ceil(assistant.content.length * 0.65))
       }
       if (event.type === 'message.replace') {
         hidingUnsupportedToolText = false
         assistant.content = event.text ?? ''
-        usage.value.outputTokens = Math.max(1, Math.ceil(assistant.content.length * 0.65))
+        usage.value.outputTokens = previousUsage.outputTokens + Math.max(1, Math.ceil(assistant.content.length * 0.65))
       }
-      if (event.type === 'usage.update' && event.usage) usage.value = { inputTokens: event.usage.inputTokens, outputTokens: event.usage.outputTokens, estimated: event.usage.estimated }
+      if (event.type === 'usage.update' && event.usage) {
+        usage.value = { inputTokens: event.usage.inputTokens, outputTokens: event.usage.outputTokens, estimated: event.usage.estimated }
+        assistant.inputTokens = Math.max(0, event.usage.inputTokens - previousUsage.inputTokens)
+        assistant.outputTokens = Math.max(0, event.usage.outputTokens - previousUsage.outputTokens)
+      }
       if (event.type === 'tool.approval_required' && event.requestId) { approvalRequest.value = { requestId: event.requestId, toolName: event.toolName ?? '本地工具', details: event.text ?? '' }; assistant.toolStatus = '等待用户批准…' }
       if (event.type === 'tool.started') assistant.toolStatus = `正在执行本地工具：${event.toolName ?? '工作区操作'}`
       if (event.type === 'tool.completed') assistant.toolStatus = '正在整理工具结果…'
@@ -613,10 +672,18 @@ function containsUnsupportedToolProtocol(content: string) {
         <div v-if="unassignedChats.length === 0" class="empty-recent">没有未归类的对话</div>
       </section>
 
-      <button class="profile" @click="activeView = 'settings'">
-        <span class="avatar">L</span><span>本地工作区</span>
-        <IconChevronRight class="profile-arrow" :size="15" :stroke-width="1.8" />
-      </button>
+      <section v-if="sidebarBalanceProvider" class="sidebar-balance">
+        <button class="sidebar-balance-query" :disabled="providerBalanceLoading" @click="queryProviderBalance(sidebarBalanceProvider.name)">
+          <span class="sidebar-balance-title">DeepSeek 余额</span>
+          <span class="sidebar-balance-action">{{ providerBalanceLoading && providerBalanceName === sidebarBalanceProvider.name ? '查询中…' : '查询余额' }}</span>
+        </button>
+        <template v-if="providerBalanceName === sidebarBalanceProvider.name && providerBalance">
+          <div class="sidebar-balance-status" :class="{ unavailable: !providerBalance.isAvailable }">{{ providerBalance.isAvailable ? '账户可用于 API 调用' : '账户余额不足' }}</div>
+          <div v-for="balance in providerBalance.balanceInfos" :key="balance.currency" class="sidebar-balance-amount"><strong>{{ balance.currency }} {{ balance.totalBalance }}</strong><small>赠金 {{ balance.grantedBalance }} · 充值 {{ balance.toppedUpBalance }}</small></div>
+          <div v-if="!providerBalance.balanceInfos.length" class="sidebar-balance-status">接口未返回余额明细</div>
+        </template>
+        <div v-if="providerBalanceName === sidebarBalanceProvider.name && providerBalanceError" class="sidebar-balance-error">{{ providerBalanceError }}</div>
+      </section>
     </aside>
 
     <main class="main-panel">
@@ -645,7 +712,7 @@ function containsUnsupportedToolProtocol(content: string) {
         </div>
       </header>
       <div v-if="workspaceError" class="workspace-error" role="alert">{{ workspaceError }}<button @click="workspaceError = ''">关闭</button></div>
-      <section v-if="activeView === 'chat' && activeChat" class="conversation" :style="{ '--output-font-size': `${outputFontSize}px` }">
+      <section v-if="activeView === 'chat' && activeChat" ref="conversationElement" class="conversation" :style="{ '--output-font-size': `${outputFontSize}px` }" @scroll="updateScrollToBottomVisibility">
         <div v-for="(message, index) in activeChat?.messages || []" :key="index" :class="['message', message.role]">
           <div v-if="message.role === 'assistant'" class="assistant-label">Lucas Agent</div>
           <details v-if="message.role === 'assistant' && message.reasoning && settings.showReasoning" class="reasoning-panel"><summary>思考过程</summary><div>{{ message.reasoning }}</div></details>
@@ -659,6 +726,7 @@ function containsUnsupportedToolProtocol(content: string) {
         </div>
       </section>
       <section v-else-if="activeView === 'chat'" class="landing-page"><div class="landing-content"><div class="landing-icon"><IconSparkles :size="22" /></div><h1>你好，我是 Lucas Agent</h1><p>描述任务后，我可以在工作区中协助你。</p><span>输入第一条消息后，将自动创建一个新对话</span></div></section>
+      <button v-if="activeView === 'chat' && activeChat && showScrollToBottom" class="scroll-bottom-button" aria-label="滚动到对话底部" title="滚动到对话底部" @click="scrollConversationToBottom"><IconChevronDown :size="20" :stroke-width="2" /></button>
       <section v-if="activeView === 'chat'" class="composer-wrap">
         <div class="composer">
           <textarea v-model="prompt" placeholder="随心输入" @keydown.enter.exact.prevent="!isRunning && sendMessage()" />
@@ -729,6 +797,12 @@ function containsUnsupportedToolProtocol(content: string) {
         </div>
         <label>API Key<input v-model="providerDraft.apiKey" type="password" :placeholder="providerHasKey ? '已保存密钥；留空则保持不变' : '粘贴 API Key'" autocomplete="new-password" /></label>
         <p class="secret-note">API Key 会在本机加密保存，不会回传给前端读取。Base URL 必须使用 HTTPS；仅 localhost 可使用 HTTP。</p>
+        <section v-if="providerDraft.existingName && isDeepSeekBaseUrl(providerDraft.baseUrl)" class="provider-balance-panel">
+          <div class="provider-balance-heading"><strong>DeepSeek 账户余额</strong><button type="button" class="add-model-button" :disabled="providerBalanceLoading || !providerHasKey" @click="queryProviderBalance(providerDraft.existingName)">{{ providerBalanceLoading && providerBalanceName === providerDraft.existingName ? '查询中…' : '查询余额' }}</button></div>
+          <p v-if="!providerHasKey" class="secret-note">请先保存 API Key 后再查询。</p>
+          <p v-if="providerBalanceName === providerDraft.existingName && providerBalanceError" class="provider-balance-error">{{ providerBalanceError }}</p>
+          <template v-if="providerBalanceName === providerDraft.existingName && providerBalance"><p class="provider-balance-status">{{ providerBalance.isAvailable ? '账户当前可用于 API 调用' : '账户余额不足，当前无法调用 API' }}</p><div v-for="balance in providerBalance.balanceInfos" :key="balance.currency" class="provider-balance-row"><strong>{{ balance.currency }} {{ balance.totalBalance }}</strong><span>赠金 {{ balance.grantedBalance }} · 充值 {{ balance.toppedUpBalance }}</span></div><p v-if="!providerBalance.balanceInfos.length" class="secret-note">接口未返回余额明细。</p></template>
+        </section>
         <div class="dialog-actions"><button v-if="providerDraft.existingName" type="button" class="reset-button" @click="removeProviderConfiguration">删除服务商</button><button type="button" class="cancel-button" @click="showProviderSettings = false">取消</button><button type="submit" class="save-button" :disabled="providerSaving">{{ providerSaving ? '保存中…' : '保存配置' }}</button></div>
       </form>
     </div>
