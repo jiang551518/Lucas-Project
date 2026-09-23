@@ -1,0 +1,6 @@
+@AgentBackend_HostAddress = http://localhost:5008
+
+GET {{AgentBackend_HostAddress}}/api/projects
+Accept: application/json
+
+###

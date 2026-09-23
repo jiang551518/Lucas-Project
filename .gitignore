@@ -1,0 +1,30 @@
+# .NET
+**/bin/
+**/obj/
+**/.vs/
+*.user
+
+# Node / Vue
+**/node_modules/
+**/dist/
+*.local
+
+# Tauri
+**/src-tauri/target/
+
+# IDE and OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Local secrets
+.env
+.env.*
+!.env.example
+
+# vue-tsc generated JavaScript must not be committed beside TypeScript sources
+AgentFrontend/src/main.js
+AgentFrontend/src/App.vue.js
+AgentFrontend/src/services/agent.js
+AgentFrontend/src/services/workspace.js
