@@ -10,7 +10,7 @@
     "desktop:dev": "concurrently -k -n web,api \"npm:dev -- --host 127.0.0.1\" \"dotnet run --project ../AgentBackend/AgentBackend/AgentBackend/AgentBackend.csproj --no-launch-profile --urls http://127.0.0.1:5008\"",
     "tauri": "tauri",
     "tauri:dev": "tauri dev",
-    "tauri:build": "tauri build"
+    "tauri:build": "node ./scripts/publish-backend.mjs && tauri build"
   },
   "dependencies": {
     "@microsoft/signalr": "^8.0.7",

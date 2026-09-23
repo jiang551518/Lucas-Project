@@ -11,6 +11,7 @@
 
 # Tauri
 **/src-tauri/target/
+AgentFrontend/src-tauri/binaries/
 
 # IDE and OS
 .idea/

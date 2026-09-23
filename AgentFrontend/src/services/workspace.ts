@@ -1,10 +1,22 @@
 const apiBase = import.meta.env.VITE_BACKEND_URL || 'http://127.0.0.1:5008'
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(`${apiBase}${path}`, {
-    ...init,
-    headers: { 'Content-Type': 'application/json', ...init?.headers },
-  })
+  let response: Response | undefined
+  let lastConnectionError: unknown
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    try {
+      response = await fetch(`${apiBase}${path}`, {
+        ...init,
+        headers: { 'Content-Type': 'application/json', ...init?.headers },
+      })
+      break
+    } catch (error) {
+      lastConnectionError = error
+      if (attempt === 19) break
+      await new Promise((resolve) => window.setTimeout(resolve, 250))
+    }
+  }
+  if (!response) throw lastConnectionError instanceof Error ? lastConnectionError : new Error('无法连接本地 Agent 服务。')
   if (!response.ok) {
     const body = await response.text()
     throw new Error(body || `HTTP ${response.status}`)

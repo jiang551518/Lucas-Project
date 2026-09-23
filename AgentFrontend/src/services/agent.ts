@@ -35,7 +35,22 @@ export async function startAgentRun(
   onEvent: (event: AgentEvent) => void,
 ) {
   if (connection.state === HubConnectionState.Disconnected) {
-    await connection.start()
+    let lastConnectionError: unknown
+    let connected = false
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      try {
+        await connection.start()
+        connected = true
+        break
+      } catch (error) {
+        lastConnectionError = error
+        if (attempt === 19) break
+        await new Promise((resolve) => window.setTimeout(resolve, 250))
+      }
+    }
+    if (!connected) {
+      throw lastConnectionError instanceof Error ? lastConnectionError : new Error('无法连接本地 Agent 服务。')
+    }
   }
 
   connection.off('agentEvent')
