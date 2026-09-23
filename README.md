@@ -2,7 +2,7 @@
 
 Lucas Agent 是一个纯本地运行的桌面 AI Agent 原型，目标是让用户在本机工作区内与不同 AI 模型协作。应用采用 Vue 3 + TypeScript 前端、Tauri 2 桌面壳和 ASP.NET Core 后端；本地数据保存在 SQLite，不需要登录或云端同步。
 
-> 当前处于开发阶段。Tauri 开发模式可以启动或复用前后端；正式发行包尚未把 .NET 后端配置为 sidecar，因此目前不能视为完整的独立安装包。
+> 当前处于开发阶段。桌面发行包会把前端和自包含的 .NET 后端一起打包；无需服务器或单独安装 .NET Runtime。每个平台的安装包需要在对应操作系统上构建，发布前仍需完成签名和多平台验证。
 
 ## 功能
 
@@ -25,7 +25,8 @@ Lucas Agent 是一个纯本地运行的桌面 AI Agent 原型，目标是让用�
 Vue 3 + TypeScript
   ├─ REST：项目、会话、模型配置、技能、记忆、设置、余额
   └─ SignalR：消息/思考增量、工具状态、审批、Token 用量、运行耗时、Git diff
-Tauri 2：桌面窗口与原生文件/目录选择
+Tauri 2：桌面窗口、原生文件/目录选择、系统托盘与应用生命周期
+  └─ 正式版启动并托管本机 .NET sidecar；托盘退出时结束后端
 ASP.NET Core
   ├─ Controller → IAgentService → AgentService
   └─ AgentService → IAgentRepository → SqliteAgentRepository
@@ -78,13 +79,27 @@ npm.cmd run tauri:dev
 
 `tauri:dev` 会检查并复用已运行的 `5173` 前端和 `5008` 后端；缺少时会启动对应服务。macOS/Linux 使用 `npm run tauri:dev`。退出桌面开发进程时，它会停止自己启动的服务，不会主动停止原先已运行的服务。
 
-构建桌面前端/壳：
+构建桌面安装包：
 
 ```powershell
-npm.cmd run tauri:build
+npm.cmd run tauri:build -- --bundles nsis
 ```
 
-macOS/Linux 使用 `npm run tauri:build`。各平台安装包需要在对应平台构建。当前 Tauri 配置尚未将 ASP.NET Core 后端打包为 sidecar；制作独立发行包前需补齐后端发布、sidecar 生命周期管理及安装包验证。
+`tauri:build` 会先运行 `scripts/publish-backend.mjs`：根据当前操作系统和 CPU 架构，对 ASP.NET Core 执行 self-contained、single-file 发布，并放入 Tauri sidecar 目录，然后构建前端和桌面安装包。生成的 sidecar 是构建产物，不需要提交到 Git。
+
+Windows 可生成 NSIS 安装程序 `.exe`，输出目录为：
+
+```text
+AgentFrontend/src-tauri/target/release/bundle/nsis/
+```
+
+若需要同时生成 WiX `.msi`，可运行 `npm.cmd run tauri:build`（不附加 `--bundles nsis`）；Windows 的 MSI 构建可能需要在“启用或关闭 Windows 功能”中启用 VBScript。当前生成的 NSIS 安装程序是未签名版本，面向外部分发前建议配置代码签名。
+
+macOS 与 Ubuntu/Linux 请在对应系统上运行 `npm run tauri:build`，由 Tauri 生成该平台的安装格式。`publish-backend.mjs` 已配置 Windows x64/ARM64、macOS x64/ARM64 和 Linux x64/ARM64 的 .NET RID 与 Tauri target triple 映射；但跨平台安装包仍需各平台原生构建环境，本项目尚未配置自动化多平台 CI，也未完成 macOS/Linux 安装和托盘行为验证。macOS 外部分发还需评估签名和公证；Linux 发行包需要目标发行版对应的 Tauri 系统依赖。
+
+正式版运行时，Tauri 桌面宿主启动绑定到 `127.0.0.1:5008` 的本机 .NET 后端，并随应用一起管理其进程。关闭主窗口会隐藏到系统托盘；托盘菜单可重新打开窗口，选择“退出 Lucas Agent”时会关闭后端和桌面程序。首次连接本机服务时，前端会短暂重试，以覆盖后端启动时间。开发模式仍使用 `scripts/desktop-dev.mjs` 启动/复用前后端，不会再额外启动 sidecar。
+
+更多平台依赖与分发细节参见 [Tauri prerequisites](https://v2.tauri.app/start/prerequisites/)、[Windows installer](https://v2.tauri.app/distribute/windows-installer/) 和 [Tauri system tray](https://v2.tauri.app/learn/system-tray/)。
 
 ## 配置 AI 服务商
 
@@ -137,7 +152,7 @@ Agent 对话通过 SignalR Hub `/hubs/agent` 启动，并以统一事件传递�
 
 - 仍是快速迭代中的 MVP，模型兼容性应按“服务商 + 模型”单独验证。
 - 工具调用会真实访问或修改本地工作区；Git diff 用于查看变更，不会自动替用户提交 Git commit。
-- 自动测试覆盖、多平台 CI、正式 Tauri + .NET sidecar 发布流程尚未完善。
+- 自动测试覆盖、多平台 CI、macOS/Linux 安装验证、发行签名/公证尚未完善；Windows NSIS 安装程序和正式版 .NET sidecar 已接入。
 
 ## GitHub
 
