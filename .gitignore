@@ -24,6 +24,14 @@ Thumbs.db
 .env.*
 !.env.example
 
+# Local SQLite databases and write-ahead logs
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
+
 # vue-tsc generated JavaScript must not be committed beside TypeScript sources
 AgentFrontend/src/main.js
 AgentFrontend/src/App.vue.js
