@@ -590,6 +590,7 @@ public sealed class SqliteAgentRepository : IAgentRepository
         transaction.Commit();
     }
 
+    /// <summary>执行只读 SQL 查询，并对每一行调用指定的映射回调。</summary>
     private static async Task ReadRowsAsync(SqliteConnection connection, SqliteTransaction transaction, string sql, Action<DbDataReader> readRow, CancellationToken cancellationToken)
     {
         await using var command = connection.CreateCommand();
@@ -599,6 +600,7 @@ public sealed class SqliteAgentRepository : IAgentRepository
         while (await reader.ReadAsync(cancellationToken)) readRow(reader);
     }
 
+    /// <summary>在给定事务中执行参数化 SQL 写入语句。</summary>
     private static async Task ExecuteAsync(SqliteConnection connection, SqliteTransaction transaction, string sql, CancellationToken cancellationToken, params (string Name, object? Value)[] parameters)
     {
         await using var command = connection.CreateCommand();
@@ -609,9 +611,11 @@ public sealed class SqliteAgentRepository : IAgentRepository
         await command.ExecuteNonQueryAsync(cancellationToken);
     }
 
+    /// <summary>按往返格式解析数据库中保存的时间戳。</summary>
     private static DateTimeOffset ParseTimestamp(string value) =>
         DateTimeOffset.Parse(value, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind);
 
+    /// <summary>将时间戳格式化为文化无关的往返字符串。</summary>
     private static string FormatTimestamp(DateTimeOffset value) => value.ToString("O", CultureInfo.InvariantCulture);
 
     /// <summary>将首条用户消息截断为侧栏可显示的会话标题。</summary>

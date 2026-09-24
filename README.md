@@ -11,8 +11,9 @@ Lucas Agent 是一个纯本地运行的桌面 AI Agent 原型，目标是让用�
 - **会话用量与耗时**：显示当前会话累计输入/输出 Token；数据库按每条 assistant 回复保存本轮用量。模型未提供 usage 时会估算并标注。回复过程显示运行状态和耗时，完成后保留本轮用时。
 - **工作区项目**：项目可关联本地目录或单个文件；对话可以归入项目或移回最近列表，并支持重命名和删除。
 - **本地工具与权限**：Agent 可列举、读取、写入工作区文件，也可运行终端命令。权限可设为“请求用户批准”或“AI 完全访问”；Windows 使用 PowerShell，macOS/Linux 使用 Bash。
+- **单文件工作区隔离**：只选单个文件时，模型只能列出、读取和写入该文件，不能运行终端命令，也不能把同目录其他文件带入上下文。
 - **代码变更预览**：显示一轮运行前后的 Git diff，便于检查 Agent 对工作区所做的更改。
-- **Harness / 工具循环**：模型可以根据任务选择工具，并将工具结果带回后续模型请求；每次运行有有限的工具往返次数，避免无限循环。
+- **Harness / 工具循环**：模型可以根据任务选择工具，并将工具结果带回后续模型请求；代码修改后会要求模型自行选择验证命令，失败时可修复并重试，结束时明确报告未验证或失败状态。工具输出有长度上限，避免异常输出耗尽内存。
 - **技能、记忆和设置**：管理本地技能和记忆；设置思考过程、Token 用量显示及新会话默认审批偏好。
 
 ### 安全说明
@@ -67,6 +68,14 @@ npm run dev
 
 然后打开 <http://localhost:5173>。macOS/Linux 可在终端一使用相同的 `dotnet run` 命令，在终端二使用 `cd AgentFrontend && npm install && npm run dev`。
 
+运行后端单元测试：
+
+```powershell
+dotnet test .\AgentBackend.Tests\AgentBackend.Tests.csproj
+```
+
+当前测试覆盖单文件工作区的列举/读写/命令隔离，以及大量终端输出的截断行为。
+
 前端默认连接 `http://127.0.0.1:5008`。如需更改后端地址，可在 `AgentFrontend/.env.local` 设置 `VITE_BACKEND_URL`。
 
 ### Tauri 桌面开发
@@ -95,9 +104,11 @@ AgentFrontend/src-tauri/target/release/bundle/nsis/
 
 若需要同时生成 WiX `.msi`，可运行 `npm.cmd run tauri:build`（不附加 `--bundles nsis`）；Windows 的 MSI 构建可能需要在“启用或关闭 Windows 功能”中启用 VBScript。当前生成的 NSIS 安装程序是未签名版本，面向外部分发前建议配置代码签名。
 
-macOS 与 Ubuntu/Linux 请在对应系统上运行 `npm run tauri:build`，由 Tauri 生成该平台的安装格式。`publish-backend.mjs` 已配置 Windows x64/ARM64、macOS x64/ARM64 和 Linux x64/ARM64 的 .NET RID 与 Tauri target triple 映射；但跨平台安装包仍需各平台原生构建环境，本项目尚未配置自动化多平台 CI，也未完成 macOS/Linux 安装和托盘行为验证。macOS 外部分发还需评估签名和公证；Linux 发行包需要目标发行版对应的 Tauri 系统依赖。
+macOS 与 Ubuntu/Linux 请在对应系统上运行 `npm run tauri:build`，由 Tauri 生成该平台的安装格式。`publish-backend.mjs` 已配置 Windows x64/ARM64、macOS x64/ARM64 和 Linux x64/ARM64 的 .NET RID 与 Tauri target triple 映射；GitHub Actions 已配置 Windows、macOS、Ubuntu 原生 runner 构建流程，但需等工作流实际运行后确认通过，且尚未完成 macOS/Linux 安装和托盘行为验证。macOS 外部分发还需评估签名和公证；Linux 发行包需要目标发行版对应的 Tauri 系统依赖。
 
-正式版运行时，Tauri 桌面宿主启动绑定到 `127.0.0.1:5008` 的本机 .NET 后端，并随应用一起管理其进程。关闭主窗口会隐藏到系统托盘；托盘菜单可重新打开窗口，选择“退出 Lucas Agent”时会关闭后端和桌面程序。首次连接本机服务时，前端会短暂重试，以覆盖后端启动时间。开发模式仍使用 `scripts/desktop-dev.mjs` 启动/复用前后端，不会再额外启动 sidecar。
+正式版运行时，Tauri 桌面宿主为本机 .NET 后端选择一个空闲的 loopback 端口，并将实际地址交给前端，再随应用一起管理后端进程。关闭主窗口会隐藏到系统托盘；托盘菜单可重新打开窗口，选择“退出 Lucas Agent”时会关闭后端和桌面程序。首次连接本机服务时，前端会短暂重试，以覆盖后端启动时间。开发模式仍使用 `scripts/desktop-dev.mjs` 启动/复用前后端，不会再额外启动 sidecar。
+
+GitHub Actions 位于 `.github/workflows/desktop.yml`：推送或创建 Pull Request 时运行后端单元测试和前端构建，并分别在 Windows、macOS、Ubuntu runner 上构建 NSIS、DMG、DEB 安装包，作为 Actions artifacts 保存。CI 只验证构建流程；macOS/Linux 安装后的托盘交互、签名/公证和目标发行版兼容性仍需在真实设备上验收。
 
 更多平台依赖与分发细节参见 [Tauri prerequisites](https://v2.tauri.app/start/prerequisites/)、[Windows installer](https://v2.tauri.app/distribute/windows-installer/) 和 [Tauri system tray](https://v2.tauri.app/learn/system-tray/)。
 
@@ -152,7 +163,7 @@ Agent 对话通过 SignalR Hub `/hubs/agent` 启动，并以统一事件传递�
 
 - 仍是快速迭代中的 MVP，模型兼容性应按“服务商 + 模型”单独验证。
 - 工具调用会真实访问或修改本地工作区；Git diff 用于查看变更，不会自动替用户提交 Git commit。
-- 自动测试覆盖、多平台 CI、macOS/Linux 安装验证、发行签名/公证尚未完善；Windows NSIS 安装程序和正式版 .NET sidecar 已接入。
+- 自动测试目前聚焦工作区隔离与工具输出边界；多平台安装包 CI 已配置，但需由 GitHub Actions 实际运行后才能确认通过。macOS/Linux 安装验收、发行签名/公证仍未完成。
 
 ## GitHub
 

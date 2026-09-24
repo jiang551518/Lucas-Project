@@ -1,0 +1,89 @@
+name: Desktop checks and packages
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    name: Backend tests and frontend build
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: AgentFrontend/package-lock.json
+      - name: Run backend unit tests
+        run: dotnet test AgentBackend.Tests/AgentBackend.Tests.csproj --configuration Release
+      - name: Install frontend dependencies
+        working-directory: AgentFrontend
+        run: npm.cmd ci
+      - name: Build frontend
+        working-directory: AgentFrontend
+        run: npm.cmd run build
+
+  desktop:
+    name: Build ${{ matrix.platform }} installer
+    needs: tests
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: Windows x64
+            os: windows-latest
+            bundle: nsis
+            artifact-path: AgentFrontend/src-tauri/target/release/bundle/nsis/*-setup.exe
+          - platform: macOS
+            os: macos-latest
+            bundle: dmg
+            artifact-path: AgentFrontend/src-tauri/target/release/bundle/dmg/*.dmg
+          - platform: Ubuntu
+            os: ubuntu-24.04
+            bundle: deb
+            artifact-path: AgentFrontend/src-tauri/target/release/bundle/deb/*.deb
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: AgentFrontend/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Ubuntu Tauri dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev libwebkit2gtk-4.1-dev
+      - name: Install frontend dependencies (Windows)
+        if: runner.os == 'Windows'
+        working-directory: AgentFrontend
+        run: npm.cmd ci
+      - name: Install frontend dependencies (Unix)
+        if: runner.os != 'Windows'
+        working-directory: AgentFrontend
+        run: npm ci
+      - name: Build installer (Windows)
+        if: runner.os == 'Windows'
+        working-directory: AgentFrontend
+        run: npm.cmd run tauri:build -- --bundles ${{ matrix.bundle }}
+      - name: Build installer (Unix)
+        if: runner.os != 'Windows'
+        working-directory: AgentFrontend
+        run: npm run tauri:build -- --bundles ${{ matrix.bundle }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lucas-agent-${{ matrix.os }}
+          path: ${{ matrix.artifact-path }}
+          if-no-files-found: error

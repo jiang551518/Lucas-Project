@@ -273,6 +273,11 @@ public sealed class AgentService : IAgentService
         var project = session.ProjectId is Guid projectId
             ? (await _repository.GetProjectsAsync(cancellationToken)).FirstOrDefault(item => item.Id == projectId)
             : null;
+        var selectedWorkspacePath = project?.WorkspacePath ?? session.WorkspacePath;
+        var selectedWorkspaceType = project?.WorkspacePathType ?? session.WorkspacePathType;
+        var selectedFilePath = selectedWorkspaceType == "file" && !string.IsNullOrWhiteSpace(selectedWorkspacePath)
+            ? Path.GetFullPath(selectedWorkspacePath)
+            : null;
         if (project is not null)
             contextParts.Add(await BuildProjectContextAsync(project, session.PermissionMode, cancellationToken));
         else if (!string.IsNullOrWhiteSpace(session.WorkspacePath))
@@ -289,13 +294,18 @@ public sealed class AgentService : IAgentService
             systemContext += "\n用户当前没有选择工作区。先前对话提到的路径只能作为历史上下文，不能视为仍有文件访问权限；如果用户要求继续在先前/当前路径执行，先请用户重新选择该工作区。";
         else
             systemContext += "\n用户已选择当前工作区。与项目有关的问题应根据此工作区的当前文件回答；用户明确要求在此路径继续执行时，使用当前授权工作区工具。";
+        if (workspaceRoot is not null && selectedFilePath is null)
+            systemContext += "\n修改工作区文件后，最终回答前必须由你根据项目结构选择并请求执行合适的验证命令（例如测试、构建或 lint）；验证命令须通过 run_command 工具发起。若验证返回非零退出码，应阅读结果，必要时修复并在剩余轮次内重新验证。若用户拒绝或环境无法运行，明确说明未验证，不得声称通过。";
         var messages = new JsonArray { new JsonObject { ["role"] = "system", ["content"] = systemContext } };
         foreach (var message in session.Messages.Where(item => item.Content.Length > 0))
             messages.Add(new JsonObject { ["role"] = message.Role, ["content"] = message.Content });
         messages.Add(new JsonObject { ["role"] = "user", ["content"] = prompt.Trim() });
 
         var reasoningProtocolHidden = false;
-        for (var iteration = 0; iteration < 10; iteration++)
+        var workspaceChanged = false;
+        var validationAttempted = false;
+        var validationFailed = false;
+        for (var iteration = 0; iteration < 13; iteration++)
         {
             int contentLengthBeforeIteration = assistantMessage.Content.Length;
             int reasoningLengthBeforeIteration = assistantMessage.Reasoning.Length;
@@ -308,7 +318,13 @@ public sealed class AgentService : IAgentService
             var requestInputTokens = 0;
             var requestOutputTokens = 0;
             var requestHasProviderUsage = false;
-            using var request = BuildRequest(provider, messages, workspaceRoot is null || iteration == 9 ? null : CreateToolDefinitions());
+            var validationOnlyIteration = iteration is >= 9 and <= 11 && workspaceChanged && (!validationAttempted || validationFailed) && selectedFilePath is null;
+            JsonArray? availableTools = workspaceRoot is null || iteration == 12
+                ? null
+                    : validationOnlyIteration
+                        ? CreateToolDefinitions(singleFileWorkspace: false)
+                    : iteration < 9 ? CreateToolDefinitions(selectedFilePath is not null) : null;
+            using var request = BuildRequest(provider, messages, availableTools);
             using var response = await _httpClientFactory.CreateClient("ModelProvider").SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
             if (!response.IsSuccessStatusCode)
             {
@@ -439,7 +455,20 @@ public sealed class AgentService : IAgentService
                     yield return AgentEvent.ReplaceMessage(runId, assistantMessage.Content);
                 }
             }
-            if (toolCalls.Count == 0) break;
+            if (toolCalls.Count == 0)
+            {
+                if (validationOnlyIteration && iteration is 9 or 10)
+                {
+                    var draft = assistantContent.ToString();
+                    assistantMessage.Content = assistantMessage.Content[..contentLengthBeforeIteration];
+                    yield return AgentEvent.ReplaceMessage(runId, assistantMessage.Content);
+                    messages.Add(new JsonObject { ["role"] = "assistant", ["content"] = draft });
+                    messages.Add(new JsonObject { ["role"] = "system", ["content"] = "你已修改工作区文件，但还没有调用验证命令。现在只需根据项目实际配置选择一个合适的测试、构建或 lint 命令，并通过 run_command 工具发起；不要重复编辑文件。若无法验证或用户拒绝，明确说明。" });
+                    yield return AgentEvent.ToolStatus(runId, "修改后验证", "started", "正在要求模型选择适当的验证命令。");
+                    continue;
+                }
+                break;
+            }
             foreach (var call in toolCalls.Values)
             {
                 // Some OpenAI-compatible streams omit these fields on malformed or
@@ -468,10 +497,12 @@ public sealed class AgentService : IAgentService
                 var toolName = function["name"]?.GetValue<string>() ?? "";
                 var arguments = function["arguments"]?.GetValue<string>() ?? "{}";
                 var details = FormatToolDetails(toolName, arguments, workspaceRoot!);
+                if (selectedFilePath is not null)
+                    details += $"\n文件授权范围：仅可访问 {Path.GetRelativePath(workspaceRoot!, selectedFilePath)}；不允许运行终端命令。";
                 yield return AgentEvent.ToolStatus(runId, toolName, "started", details);
                 string toolResult;
                 if (session.PermissionMode == "fullAccess")
-                    toolResult = await ExecuteWorkspaceToolAsync(toolName, arguments, workspaceRoot!, cancellationToken);
+                    toolResult = await ExecuteWorkspaceToolAsync(toolName, arguments, workspaceRoot!, cancellationToken, selectedFilePath);
                 else if (string.IsNullOrWhiteSpace(connectionId))
                     toolResult = "工具调用未执行：没有可用于审批的桌面连接。";
                 else
@@ -480,14 +511,32 @@ public sealed class AgentService : IAgentService
                     yield return AgentEvent.ApprovalRequired(runId, approval.RequestId, toolName, details);
                     var approved = await _approvalBroker.WaitAsync(approval.RequestId, approval.Result, cancellationToken);
                     toolResult = approved
-                        ? await ExecuteWorkspaceToolAsync(toolName, arguments, workspaceRoot!, cancellationToken)
+                        ? await ExecuteWorkspaceToolAsync(toolName, arguments, workspaceRoot!, cancellationToken, selectedFilePath)
                         : "用户拒绝或未批准了这次工具调用。不要重复尝试该操作；请告知用户并询问下一步。";
                 }
                 yield return AgentEvent.ToolStatus(runId, toolName, "completed", details);
                 messages.Add(new JsonObject { ["role"] = "tool", ["tool_call_id"] = callId, ["content"] = toolResult });
+                if (toolName == "write_file" && toolResult.StartsWith("已写入 ", StringComparison.Ordinal))
+                {
+                    workspaceChanged = true;
+                    validationAttempted = false;
+                    validationFailed = false;
+                }
+                else if (toolName == "run_command" && workspaceChanged)
+                {
+                    validationAttempted = true;
+                    validationFailed = !HasSuccessfulCommandExitCode(toolResult);
+                }
             }
         }
 
+        if (workspaceChanged && selectedFilePath is null && (!validationAttempted || validationFailed))
+        {
+            assistantMessage.Content += validationFailed
+                ? "\n\n验证命令失败或未能正常完成；本轮改动尚未确认通过，请检查上方命令输出。"
+                : "\n\n工作区文件已修改，但没有成功发起验证命令；本轮改动尚未验证。";
+            yield return AgentEvent.ReplaceMessage(runId, assistantMessage.Content);
+        }
         await _repository.AddMessageAsync(sessionId, assistantMessage, cancellationToken);
         var gitDiff = workspaceRoot is null ? null : await _gitChangeTracker.GetDiffAsync(gitSnapshot, workspaceRoot, cancellationToken);
         if (gitDiff is not null) yield return AgentEvent.GitDiff(runId, gitDiff);
@@ -495,6 +544,13 @@ public sealed class AgentService : IAgentService
         await _repository.UpdateUsageAsync(assistantMessage.Id, inputTokens, outputTokens, assistantMessage.ElapsedMilliseconds.Value, gitDiff, cancellationToken);
         yield return AgentEvent.UsageUpdate(runId, new UsageSnapshot(previousInputTokens + inputTokens, previousOutputTokens + outputTokens, previousInputTokens + previousOutputTokens + inputTokens + outputTokens, hasEstimatedUsage));
         yield return AgentEvent.Completed(runId, stopwatch.ElapsedMilliseconds);
+    }
+
+    /// <summary>仅当终端工具明确返回退出码零时，才将验证视为成功。</summary>
+    internal static bool HasSuccessfulCommandExitCode(string toolResult)
+    {
+        var match = Regex.Match(toolResult, @"退出码：\s*(-?\d+)");
+        return match.Success && int.TryParse(match.Groups[1].Value, out var exitCode) && exitCode == 0;
     }
 
     /// <summary>保存被用户停止的部分回答与思考，并写入估算 Token 和已用时。</summary>
@@ -525,7 +581,17 @@ public sealed class AgentService : IAgentService
             : "权限模式：请求用户批准。任何本地读写或命令操作前，必须先向用户说明具体动作并等待批准。");
         if (permissionMode != "fullAccess")
         {
-            parts.Add("当前为请求批准模式，不会预先读取此工作区中的文件或目录清单。需要使用本地工具时必须逐次向用户展示具体动作并等待桌面端明确批准；拒绝时不得执行。");
+            parts.Add(project.WorkspacePathType == "file"
+                ? "当前为请求批准模式，不会预先读取所选文件。仅可列出、读取或写入用户指定的这个文件；不能访问同目录的其他文件，也不能运行终端命令。需要使用本地工具时必须逐次展示具体动作并等待桌面端明确批准。"
+                : "当前为请求批准模式，不会预先读取此工作区中的文件或目录清单。需要使用本地工具时必须逐次向用户展示具体动作并等待桌面端明确批准；拒绝时不得执行。");
+            return string.Join("\n\n", parts);
+        }
+        if (project.WorkspacePathType == "file")
+        {
+            if (!File.Exists(project.WorkspacePath)) return string.Join("\n\n", parts) + "\n所选工作文件当前不存在。不要声称已检查或执行项目。";
+            var content = await File.ReadAllTextAsync(project.WorkspacePath, cancellationToken);
+            parts.Add($"唯一授权文件 {Path.GetFileName(project.WorkspacePath)}（最多读取 8,000 字符）：\n{content[..Math.Min(content.Length, 8000)]}");
+            parts.Add("当前工作区是单文件模式：只能列出、读取或写入这个指定文件，不能访问同目录其他文件，也不能运行终端命令。用户需要目录级操作时，请让其改选工作目录。");
             return string.Join("\n\n", parts);
         }
         var manifests = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
@@ -586,7 +652,9 @@ public sealed class AgentService : IAgentService
     }
 
     /// <summary>定义 Agent 可请求的工作区文件列表、读取、写入及系统终端工具。</summary>
-    private static JsonArray CreateToolDefinitions() => JsonNode.Parse("""
+    private static JsonArray CreateToolDefinitions(bool singleFileWorkspace)
+    {
+        var tools = JsonNode.Parse("""
     [
       {"type":"function","function":{"name":"list_files","description":"列出工作区内的文件相对路径；可选指定目录。","parameters":{"type":"object","properties":{"path":{"type":"string","description":"相对目录路径，默认为工作区根目录"}},"additionalProperties":false}}},
       {"type":"function","function":{"name":"read_file","description":"读取工作区中的文本文件。","parameters":{"type":"object","properties":{"path":{"type":"string","description":"工作区内相对文件路径"}},"required":["path"],"additionalProperties":false}}},
@@ -595,6 +663,11 @@ public sealed class AgentService : IAgentService
     ]
     """)!.AsArray();
 
+        if (singleFileWorkspace) tools.RemoveAt(3);
+        return tools;
+    }
+
+    /// <summary>检测模型正文中疑似未结构化输出的工具协议标记。</summary>
     private static bool ContainsUnsupportedToolProtocol(string content)
     {
         // Some model gateways insert spaces or full-width separators between visible token parts.
@@ -694,9 +767,9 @@ public sealed class AgentService : IAgentService
     }
 
     /// <summary>执行工作区工具，并把参数、路径或文件系统异常转换为模型可处理的工具结果。</summary>
-    private async Task<string> ExecuteWorkspaceToolAsync(string toolName, string arguments, string workspaceRoot, CancellationToken cancellationToken)
+    private async Task<string> ExecuteWorkspaceToolAsync(string toolName, string arguments, string workspaceRoot, CancellationToken cancellationToken, string? selectedFilePath = null)
     {
-        try { return await _toolExecutor.ExecuteAsync(toolName, arguments, workspaceRoot, cancellationToken); }
+        try { return await _toolExecutor.ExecuteAsync(toolName, arguments, workspaceRoot, cancellationToken, selectedFilePath); }
         catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or ArgumentException or JsonException or InvalidOperationException)
         {
             return $"工具执行失败：{exception.Message}";

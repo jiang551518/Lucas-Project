@@ -1,10 +1,11 @@
-const apiBase = import.meta.env.VITE_BACKEND_URL || 'http://127.0.0.1:5008'
+import { getBackendUrl } from './backend'
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   let response: Response | undefined
   let lastConnectionError: unknown
   for (let attempt = 0; attempt < 20; attempt += 1) {
     try {
+      const apiBase = await getBackendUrl()
       response = await fetch(`${apiBase}${path}`, {
         ...init,
         headers: { 'Content-Type': 'application/json', ...init?.headers },

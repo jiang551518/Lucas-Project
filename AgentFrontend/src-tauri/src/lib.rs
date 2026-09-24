@@ -1,4 +1,5 @@
 use std::sync::Mutex;
+use std::net::TcpListener;
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{Manager, RunEvent, WindowEvent};
@@ -6,6 +7,13 @@ use tauri_plugin_shell::process::{CommandChild, CommandEvent};
 use tauri_plugin_shell::ShellExt;
 
 struct BackendProcess(Mutex<Option<CommandChild>>);
+struct BackendEndpoint(Mutex<String>);
+
+/// Returns the loopback URL reserved for the managed local API process.
+#[tauri::command]
+fn get_backend_url(endpoint: tauri::State<'_, BackendEndpoint>) -> String {
+    endpoint.0.lock().map(|url| url.clone()).unwrap_or_else(|_| "http://127.0.0.1:5008".to_string())
+}
 
 /// Starts the packaged local API, builds the tray menu, and manages desktop shutdown.
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -13,7 +21,9 @@ pub fn run() {
     let application = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_shell::init())
+        .invoke_handler(tauri::generate_handler![get_backend_url])
         .setup(|app| {
+            app.manage(BackendEndpoint(Mutex::new("http://127.0.0.1:5008".to_string())));
             if cfg!(debug_assertions) {
                 app.handle().plugin(
                     tauri_plugin_log::Builder::default()
@@ -46,10 +56,17 @@ pub fn run() {
 
 /// Launches the self-contained ASP.NET sidecar and drains its output streams.
 fn start_backend(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
+    let reserved_listener = TcpListener::bind("127.0.0.1:0")?;
+    let port = reserved_listener.local_addr()?.port();
+    drop(reserved_listener);
+    let backend_url = format!("http://127.0.0.1:{port}");
+    if let Some(endpoint) = app.try_state::<BackendEndpoint>() {
+        *endpoint.0.lock().map_err(|_| "backend URL state is poisoned")? = backend_url.clone();
+    }
     let (mut events, child) = app
         .shell()
         .sidecar("lucas-agent-backend")?
-        .args(["--urls", "http://127.0.0.1:5008"])
+        .args(["--urls".to_string(), backend_url])
         .spawn()?;
 
     tauri::async_runtime::spawn(async move {

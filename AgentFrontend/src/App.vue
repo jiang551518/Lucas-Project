@@ -441,9 +441,8 @@ async function confirmWorkspaceDialog() {
   try {
     if (dialog.kind === 'delete-chat') {
       await deleteSession(dialog.id)
-      const index = chats.value.findIndex(item => item.id === dialog.id)
       chats.value = chats.value.filter(item => item.id !== dialog.id)
-      if (activeChatId.value === dialog.id) activeChatId.value = chats.value[Math.max(0, index - 1)]?.id ?? ''
+      if (activeChatId.value === dialog.id) beginNewChat()
     } else if (dialog.kind === 'delete-project') {
       await deleteProjectRequest(dialog.id)
       projects.value = projects.value.filter(item => item.id !== dialog.id)
@@ -547,7 +546,10 @@ async function sendMessage() {
   prompt.value = ''
   const assistant: Chat['messages'][number] = { id: crypto.randomUUID(), createdAt: new Date().toISOString(), role: 'assistant', content: '', reasoning: '', startedAtMs: Date.now(), toolStatus: '' }
   chat.messages.push(assistant)
-  usage.value = { inputTokens: previousUsage.inputTokens + Math.max(1, Math.ceil(text.length * 0.65)), outputTokens: previousUsage.outputTokens, estimated: true }
+  const estimatedInputTokens = Math.max(1, Math.ceil(text.length * 0.65))
+  assistant.inputTokens = estimatedInputTokens
+  if (activeChatId.value === chat.id)
+    usage.value = { inputTokens: previousUsage.inputTokens + estimatedInputTokens, outputTokens: previousUsage.outputTokens, estimated: true }
   let hidingUnsupportedToolText = false
   let hidingUnsupportedToolReasoning = false
   isRunning.value = true
@@ -581,22 +583,26 @@ async function sendMessage() {
           hidingUnsupportedToolText = true
           assistant.content = '检测到模型把内部工具协议当作正文输出，已隐藏这段内容。若没有后续回答，请改用支持标准 function calling 的模型或服务商后重试。'
           assistant.toolStatus = '已拦截非标准工具调用文本'
-          usage.value.outputTokens = previousUsage.outputTokens + Math.max(1, Math.ceil(assistant.content.length * 0.65))
+          assistant.outputTokens = Math.max(1, Math.ceil(assistant.content.length * 0.65))
+          if (activeChatId.value === chat.id) usage.value.outputTokens = previousUsage.outputTokens + assistant.outputTokens
           return
         }
         assistant.content = nextContent
         assistant.toolStatus = '正在生成回答…'
-        usage.value.outputTokens = previousUsage.outputTokens + Math.max(1, Math.ceil(assistant.content.length * 0.65))
+        assistant.outputTokens = Math.max(1, Math.ceil(assistant.content.length * 0.65))
+        if (activeChatId.value === chat.id) usage.value.outputTokens = previousUsage.outputTokens + assistant.outputTokens
       }
       if (event.type === 'message.replace') {
         hidingUnsupportedToolText = false
         assistant.content = event.text ?? ''
-        usage.value.outputTokens = previousUsage.outputTokens + Math.max(1, Math.ceil(assistant.content.length * 0.65))
+        assistant.outputTokens = Math.max(1, Math.ceil(assistant.content.length * 0.65))
+        if (activeChatId.value === chat.id) usage.value.outputTokens = previousUsage.outputTokens + assistant.outputTokens
       }
       if (event.type === 'usage.update' && event.usage) {
-        usage.value = { inputTokens: event.usage.inputTokens, outputTokens: event.usage.outputTokens, estimated: event.usage.estimated }
         assistant.inputTokens = Math.max(0, event.usage.inputTokens - previousUsage.inputTokens)
         assistant.outputTokens = Math.max(0, event.usage.outputTokens - previousUsage.outputTokens)
+        if (activeChatId.value === chat.id)
+          usage.value = { inputTokens: event.usage.inputTokens, outputTokens: event.usage.outputTokens, estimated: event.usage.estimated }
       }
       if (event.type === 'tool.approval_required' && event.requestId) { approvalRequest.value = { requestId: event.requestId, toolName: event.toolName ?? '本地工具', details: event.text ?? '' }; assistant.toolStatus = '等待用户批准…' }
       if (event.type === 'tool.started') assistant.toolStatus = `正在执行本地工具：${event.toolName ?? '工作区操作'}`
@@ -783,7 +789,7 @@ function containsUnsupportedToolProtocol(content: string) {
       <section v-if="activeView === 'settings'" class="management-page settings-page">
         <div class="management-heading"><div><h1>设置</h1><p>本地偏好、运行安全与工作区校验参数。</p></div><button class="save-button" :disabled="settingsSaving" @click="persistSettings">{{ settingsSaving ? '保存中…' : '保存设置' }}</button></div>
         <div class="settings-group"><h2>显示</h2><label class="setting-row"><span><strong>显示思考过程</strong><small>仅展示模型接口实际返回的 reasoning 字段。</small></span><input v-model="settings.showReasoning" type="checkbox" /></label><label class="setting-row"><span><strong>显示 Token 用量</strong><small>实时估算或显示服务商返回的用量。</small></span><input v-model="settings.showTokenUsage" type="checkbox" /></label></div>
-        <div class="settings-group"><h2>Harness Engineering 与 Loop Engineering</h2><p class="settings-note">Agent 根据任务自行选择工作区文件、工具和验证步骤，并把真实工具结果带回模型继续处理。单次运行最多进行 9 轮工具往返，避免意外无限循环。终端命令使用当前系统用户权限，工作目录不是操作系统级沙箱。</p><label class="setting-row"><span><strong>新对话默认请求批准</strong><small>设为默认安全模式；每个对话仍可在输入框权限菜单中单独切换。</small></span><input v-model="settings.requireToolApproval" type="checkbox" /></label></div>
+        <div class="settings-group"><h2>Harness Engineering 与 Loop Engineering</h2><p class="settings-note">Agent 根据任务自行选择工作区文件、工具和验证步骤，并把真实工具结果带回模型继续处理。一般任务最多 9 轮工具往返；代码修改后会要求模型选择验证命令，失败时可修复并重试。终端命令使用当前系统用户权限，工作目录不是操作系统级沙箱。</p><label class="setting-row"><span><strong>新对话默认请求批准</strong><small>设为默认安全模式；每个对话仍可在输入框权限菜单中单独切换。</small></span><input v-model="settings.requireToolApproval" type="checkbox" /></label></div>
         <div class="local-note">此应用为纯本地模式：没有账号登录或云端同步。SQLite 数据库位于当前系统用户的应用数据目录。</div>
       </section>
     </main>

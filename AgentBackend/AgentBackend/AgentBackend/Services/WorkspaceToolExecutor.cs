@@ -15,23 +15,33 @@ public sealed class WorkspaceToolExecutor
     };
 
     /// <summary>根据 OpenAI 工具参数分派文件读取、文件写入或跨平台终端命令。</summary>
-    public async Task<string> ExecuteAsync(string toolName, string argumentsJson, string workspaceRoot, CancellationToken cancellationToken)
+    public async Task<string> ExecuteAsync(string toolName, string argumentsJson, string workspaceRoot, CancellationToken cancellationToken, string? selectedFilePath = null)
     {
         using var arguments = JsonDocument.Parse(string.IsNullOrWhiteSpace(argumentsJson) ? "{}" : argumentsJson);
         var root = Path.GetFullPath(workspaceRoot);
+        var selectedFile = selectedFilePath is null ? null : Path.GetFullPath(selectedFilePath);
         return toolName switch
         {
-            "list_files" => ListFiles(root, GetOptionalString(arguments.RootElement, "path")),
-            "read_file" => await ReadFileAsync(root, GetRequiredString(arguments.RootElement, "path"), cancellationToken),
-            "write_file" => await WriteFileAsync(root, GetRequiredString(arguments.RootElement, "path"), GetRequiredString(arguments.RootElement, "content"), cancellationToken),
+            "list_files" => ListFiles(root, GetOptionalString(arguments.RootElement, "path"), selectedFile),
+            "read_file" => await ReadFileAsync(root, GetRequiredString(arguments.RootElement, "path"), cancellationToken, selectedFile),
+            "write_file" => await WriteFileAsync(root, GetRequiredString(arguments.RootElement, "path"), GetRequiredString(arguments.RootElement, "content"), cancellationToken, selectedFile),
+            "run_command" when selectedFile is not null => throw new UnauthorizedAccessException("当前工作区只授权了单个文件，不能运行终端命令。请选择工作目录后再执行命令。"),
             "run_command" => await RunCommandAsync(root, GetRequiredString(arguments.RootElement, "command"), cancellationToken),
             _ => throw new InvalidOperationException($"未知的 Agent 工具：{toolName}")
         };
     }
 
     /// <summary>列出工作区内有限数量的文件相对路径，并跳过常见依赖与构建目录。</summary>
-    private static string ListFiles(string root, string? relativePath)
+    private static string ListFiles(string root, string? relativePath, string? selectedFile)
     {
+        if (selectedFile is not null)
+        {
+            EnsureSelectedFile(root, selectedFile, relativePath);
+            EnsureNoReparsePoint(root, selectedFile);
+            if (!File.Exists(selectedFile)) throw new FileNotFoundException("所选工作文件不存在。", selectedFile);
+            return Path.GetRelativePath(root, selectedFile);
+        }
+
         var start = string.IsNullOrWhiteSpace(relativePath) ? root : ResolvePath(root, relativePath);
         if (!Directory.Exists(start)) throw new DirectoryNotFoundException("请求的目录不存在。");
         var results = new List<string>();
@@ -56,9 +66,10 @@ public sealed class WorkspaceToolExecutor
     }
 
     /// <summary>读取工作区内文本文件，拒绝越界路径并限制返回字符数。</summary>
-    private static async Task<string> ReadFileAsync(string root, string relativePath, CancellationToken cancellationToken)
+    private static async Task<string> ReadFileAsync(string root, string relativePath, CancellationToken cancellationToken, string? selectedFile)
     {
-        var path = ResolvePath(root, relativePath);
+        EnsureSelectedFile(root, selectedFile, relativePath);
+        var path = selectedFile ?? ResolvePath(root, relativePath);
         EnsureNoReparsePoint(root, path);
         if (!File.Exists(path)) throw new FileNotFoundException("请求的工作区文件不存在。", relativePath);
         var content = await File.ReadAllTextAsync(path, cancellationToken);
@@ -66,9 +77,10 @@ public sealed class WorkspaceToolExecutor
     }
 
     /// <summary>在工作区内创建或覆盖指定文本文件，并返回其相对路径和写入大小。</summary>
-    private static async Task<string> WriteFileAsync(string root, string relativePath, string content, CancellationToken cancellationToken)
+    private static async Task<string> WriteFileAsync(string root, string relativePath, string content, CancellationToken cancellationToken, string? selectedFile)
     {
-        var path = ResolvePath(root, relativePath);
+        EnsureSelectedFile(root, selectedFile, relativePath);
+        var path = selectedFile ?? ResolvePath(root, relativePath);
         EnsureNoReparsePoint(root, path);
         var parent = Path.GetDirectoryName(path) ?? throw new IOException("无效的文件路径。");
         Directory.CreateDirectory(parent);
@@ -112,8 +124,9 @@ public sealed class WorkspaceToolExecutor
         try
         {
             if (!process.Start()) throw new InvalidOperationException("无法启动本机终端进程。");
-            var stdoutTask = process.StandardOutput.ReadToEndAsync(cancellationToken);
-            var stderrTask = process.StandardError.ReadToEndAsync(cancellationToken);
+            var perStreamLimit = (MaxCommandOutputCharacters - 80) / 2;
+            var stdoutTask = ReadBoundedOutputAsync(process.StandardOutput, perStreamLimit);
+            var stderrTask = ReadBoundedOutputAsync(process.StandardError, perStreamLimit);
             using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
             timeout.CancelAfter(TimeSpan.FromMinutes(2));
             try { await process.WaitForExitAsync(timeout.Token); }
@@ -125,8 +138,8 @@ public sealed class WorkspaceToolExecutor
             }
             var output = await stdoutTask;
             var error = await stderrTask;
-            var combined = $"退出码：{process.ExitCode}\n标准输出：\n{output}\n标准错误：\n{error}";
-            return combined.Length <= MaxCommandOutputCharacters ? combined : combined[..MaxCommandOutputCharacters] + "\n…（输出已截断）";
+            var truncationNotice = output.Truncated || error.Truncated ? "\n…（命令输出已达到长度上限，剩余输出已丢弃）" : string.Empty;
+            return $"退出码：{process.ExitCode}\n标准输出：\n{output.Text}\n标准错误：\n{error.Text}{truncationNotice}";
         }
         catch (System.ComponentModel.Win32Exception exception)
         {
@@ -134,6 +147,39 @@ public sealed class WorkspaceToolExecutor
                 ? $"无法启动 PowerShell（powershell.exe）：{exception.Message}"
                 : $"无法启动 Bash（/bin/bash）：{exception.Message}";
         }
+    }
+
+    /// <summary>持续排空终端流但只保留限定字符，避免大输出耗尽桌面应用内存。</summary>
+    internal static async Task<BoundedOutput> ReadBoundedOutputAsync(TextReader reader, int maximumCharacters)
+    {
+        var buffer = new char[2048];
+        var retained = new StringBuilder(Math.Min(maximumCharacters, buffer.Length));
+        var truncated = false;
+        while (true)
+        {
+            var count = await reader.ReadAsync(buffer, 0, buffer.Length);
+            if (count == 0) break;
+            var remaining = maximumCharacters - retained.Length;
+            if (remaining > 0) retained.Append(buffer, 0, Math.Min(count, remaining));
+            if (count > remaining) truncated = true;
+        }
+        return new BoundedOutput(retained.ToString(), truncated);
+    }
+
+    /// <summary>验证单文件工作区中的路径是否恰好指向用户选中的文件。</summary>
+    private static void EnsureSelectedFile(string root, string? selectedFile, string? requestedPath)
+    {
+        if (selectedFile is null) return;
+        var selectedRelativePath = Path.GetRelativePath(root, selectedFile);
+        string requestedFullPath;
+        try { requestedFullPath = requestedPath is null ? selectedFile : ResolvePath(root, requestedPath); }
+        catch (ArgumentException exception)
+        {
+            throw new UnauthorizedAccessException("当前工作区只授权访问所选文件。", exception);
+        }
+        var comparison = OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
+        if (!string.Equals(Path.GetFullPath(requestedFullPath), Path.GetFullPath(selectedFile), comparison))
+            throw new UnauthorizedAccessException($"当前只授权访问所选文件：{selectedRelativePath}");
     }
 
     /// <summary>解析相对路径并拒绝绝对路径或逃逸工作区根目录的路径。</summary>
@@ -169,3 +215,6 @@ public sealed class WorkspaceToolExecutor
     private static string? GetOptionalString(JsonElement element, string name) =>
         element.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.String ? value.GetString() : null;
 }
+
+/// <summary>表示被保留的有限终端输出及是否丢弃了额外内容。</summary>
+internal sealed record BoundedOutput(string Text, bool Truncated);
