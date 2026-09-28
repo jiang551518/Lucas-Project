@@ -67,9 +67,17 @@ public sealed class SqliteAgentRepository : IAgentRepository
                 Id INTEGER PRIMARY KEY CHECK (Id = 1), ShowReasoning INTEGER NOT NULL,
                 ShowTokenUsage INTEGER NOT NULL, RequireToolApproval INTEGER NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS VideoAgentSettings (
+                Id INTEGER PRIMARY KEY CHECK (Id = 1), BaseUrl TEXT NOT NULL,
+                WorkflowPath TEXT NOT NULL, PromptNodeId TEXT NOT NULL,
+                PromptInputName TEXT NOT NULL, ImageNodeId TEXT NOT NULL DEFAULT '',
+                ImageInputName TEXT NOT NULL DEFAULT 'image', ProtectedApiToken TEXT NOT NULL
+            );
             DROP TABLE IF EXISTS WorkspaceState;
             """;
         command.ExecuteNonQuery();
+        EnsureColumn(connection, "VideoAgentSettings", "ImageNodeId", "TEXT NOT NULL DEFAULT ''");
+        EnsureColumn(connection, "VideoAgentSettings", "ImageInputName", "TEXT NOT NULL DEFAULT 'image'");
     }
 
     /// <summary>读取所有项目，并按名称排序返回。</summary>
@@ -382,6 +390,16 @@ public sealed class SqliteAgentRepository : IAgentRepository
         finally { _gate.Release(); }
     }
 
+    public async Task<StoredVideoAgentConfig?> GetVideoAgentConfigAsync(CancellationToken cancellationToken = default) =>
+        (await ReadAsync(cancellationToken)).VideoAgentConfig;
+
+    public async Task SaveVideoAgentConfigAsync(StoredVideoAgentConfig config, CancellationToken cancellationToken = default)
+    {
+        await _gate.WaitAsync(cancellationToken);
+        try { var data = await ReadUnlockedAsync(cancellationToken); data.VideoAgentConfig = config; await SaveUnlockedAsync(data, cancellationToken); }
+        finally { _gate.Release(); }
+    }
+
     /// <summary>在异步锁保护下读取工作区数据。</summary>
     private async Task<WorkspaceData> ReadAsync(CancellationToken cancellationToken)
     {
@@ -499,6 +517,18 @@ public sealed class SqliteAgentRepository : IAgentRepository
                 ShowTokenUsage = row.GetInt64(1) != 0,
                 RequireToolApproval = row.GetInt64(2) != 0
             }, cancellationToken);
+        await ReadRowsAsync(connection, transaction,
+            "SELECT BaseUrl, WorkflowPath, PromptNodeId, PromptInputName, ImageNodeId, ImageInputName, ProtectedApiToken FROM VideoAgentSettings WHERE Id = 1;",
+            row => data.VideoAgentConfig = new StoredVideoAgentConfig
+            {
+                BaseUrl = row.GetString(0),
+                WorkflowPath = row.GetString(1),
+                PromptNodeId = row.GetString(2),
+                PromptInputName = row.GetString(3),
+                ImageNodeId = row.GetString(4),
+                ImageInputName = row.GetString(5),
+                ProtectedApiToken = row.GetString(6)
+            }, cancellationToken);
 
         transaction.Commit();
         return data;
@@ -519,6 +549,7 @@ public sealed class SqliteAgentRepository : IAgentRepository
             DELETE FROM Skills;
             DELETE FROM Memories;
             DELETE FROM Settings;
+            DELETE FROM VideoAgentSettings;
             """, cancellationToken);
 
         foreach (var project in data.Projects)
@@ -587,6 +618,14 @@ public sealed class SqliteAgentRepository : IAgentRepository
             ("$showReasoning", data.Settings.ShowReasoning ? 1 : 0),
             ("$showTokenUsage", data.Settings.ShowTokenUsage ? 1 : 0),
             ("$requireToolApproval", data.Settings.RequireToolApproval ? 1 : 0));
+        if (data.VideoAgentConfig is not null)
+            await ExecuteAsync(connection, transaction,
+                "INSERT INTO VideoAgentSettings (Id, BaseUrl, WorkflowPath, PromptNodeId, PromptInputName, ImageNodeId, ImageInputName, ProtectedApiToken) VALUES (1, $baseUrl, $workflowPath, $promptNodeId, $promptInputName, $imageNodeId, $imageInputName, $protectedApiToken);",
+                cancellationToken,
+                ("$baseUrl", data.VideoAgentConfig.BaseUrl), ("$workflowPath", data.VideoAgentConfig.WorkflowPath),
+                ("$promptNodeId", data.VideoAgentConfig.PromptNodeId), ("$promptInputName", data.VideoAgentConfig.PromptInputName),
+                ("$imageNodeId", data.VideoAgentConfig.ImageNodeId), ("$imageInputName", data.VideoAgentConfig.ImageInputName),
+                ("$protectedApiToken", data.VideoAgentConfig.ProtectedApiToken));
         transaction.Commit();
     }
 
@@ -598,6 +637,21 @@ public sealed class SqliteAgentRepository : IAgentRepository
         command.CommandText = sql;
         await using var reader = await command.ExecuteReaderAsync(cancellationToken);
         while (await reader.ReadAsync(cancellationToken)) readRow(reader);
+    }
+
+    private static void EnsureColumn(SqliteConnection connection, string table, string column, string definition)
+    {
+        using var command = connection.CreateCommand();
+        command.CommandText = $"PRAGMA table_info({table});";
+        using var reader = command.ExecuteReader();
+        while (reader.Read())
+        {
+            if (reader.GetString(1).Equals(column, StringComparison.OrdinalIgnoreCase)) return;
+        }
+        reader.Close();
+        using var alter = connection.CreateCommand();
+        alter.CommandText = $"ALTER TABLE {table} ADD COLUMN {column} {definition};";
+        alter.ExecuteNonQuery();
     }
 
     /// <summary>在给定事务中执行参数化 SQL 写入语句。</summary>

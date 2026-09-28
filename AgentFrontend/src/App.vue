@@ -11,8 +11,9 @@ import {
 } from '@tabler/icons-vue'
 import { pauseOrStopAgentRun, respondToApproval, startAgentRun, type AgentEvent } from './services/agent'
 import { createProject as createProjectRequest, createSession, deleteProject as deleteProjectRequest, deleteProvider, deleteSession, deleteSkill, deleteMemory, getProjects, getProviders, getProviderBalance, getSessions, getSkills, getMemories, getSettings, renameProject as renameProjectRequest, renameSession as renameSessionRequest, saveProvider, saveSkill, saveMemory, saveSettings as saveSettingsRequest, updateExecutionContext, type AgentSkill, type AgentSettings, type MemoryEntry, type ProviderBalance, type ProviderSummary, type WorkspaceProject, type WorkspaceSession } from './services/workspace'
+import { cancelVideoJob, checkVideoApiHealth, getVideoAgentConfig, getVideoJob, saveVideoAgentConfig, streamVideoJobEvents, submitVideoJob, type VideoAgentConfig, type VideoJobEvent } from './services/video'
 
-type Chat = WorkspaceSession & { updatedAt: string; messages: (WorkspaceSession['messages'][number] & { elapsedMilliseconds?: number; startedAtMs?: number; toolStatus?: string; showGitDiff?: boolean })[] }
+type Chat = WorkspaceSession & { updatedAt: string; messages: (WorkspaceSession['messages'][number] & { elapsedMilliseconds?: number; startedAtMs?: number; toolStatus?: string; showGitDiff?: boolean; videoPromptEligible?: boolean; videoJobId?: string; videoJobStatus?: string; videoJobDetail?: string; videoJobProgress?: number; videoJobProgressLabel?: string; videoJobCancelling?: boolean })[] }
 type Project = WorkspaceProject & { expanded: boolean }
 type WorkspaceDialog = { kind: 'delete-chat' | 'delete-project' | 'rename-chat' | 'rename-project'; id: string; name: string; relatedCount?: number }
 const projects = ref<Project[]>([])
@@ -28,6 +29,7 @@ const settingsSaving = ref(false)
 
 const selectedProviderName = ref('')
 const selectedModel = ref('')
+const agentMode = ref<'daily' | 'video'>('daily')
 const modelPickerLabel = computed(() => selectedModel.value || '添加 AI 服务商')
 const showModelMenu = ref(false)
 const prompt = ref('')
@@ -64,6 +66,13 @@ const providerBalance = ref<ProviderBalance | null>(null)
 const providerBalanceError = ref('')
 const providerBalanceLoading = ref(false)
 const providerBalanceName = ref('')
+const videoConfig = ref<VideoAgentConfig>({ baseUrl: 'http://127.0.0.1:8188', hasApiToken: false })
+const videoConfigDraft = ref({ mode: 'local' as 'local' | 'remote', baseUrl: 'http://127.0.0.1:8188', apiToken: '' })
+const videoConfigSaving = ref(false)
+const videoHealthLoading = ref(false)
+const videoHealthStatus = ref('')
+const videoHealthError = ref('')
+const videoJobControllers = new Map<string, AbortController>()
 const activeChat = computed(() => chats.value.find(chat => chat.id === activeChatId.value))
 const sidebarBalanceProvider = computed(() =>
   providers.value.find(provider => provider.name === selectedProviderName.value && provider.hasApiKey && isDeepSeekBaseUrl(provider.baseUrl))
@@ -98,6 +107,11 @@ onMounted(async () => {
     skills.value = serverSkills
     memories.value = serverMemories
     settings.value = serverSettings
+    try {
+      videoConfig.value = await getVideoAgentConfig()
+      const remote = !videoConfig.value.baseUrl.startsWith('http://127.0.0.1:') && !videoConfig.value.baseUrl.startsWith('http://localhost:')
+      videoConfigDraft.value = { mode: remote ? 'remote' : 'local', baseUrl: videoConfig.value.baseUrl, apiToken: '' }
+    } catch { /* Older backend versions may not expose video mode yet. */ }
     const firstProvider = serverProviders.find(provider => provider.models.length > 0)
     if (firstProvider) selectModel(firstProvider.name, firstProvider.models[0])
     const initialChat = chats.value.find(chat => chat.messages.length > 0)
@@ -219,6 +233,35 @@ async function persistSettings() {
   try { settings.value = await saveSettingsRequest(settings.value); workspaceError.value = '' }
   catch (error) { workspaceError.value = `保存设置失败：${String(error)}` }
   finally { settingsSaving.value = false }
+}
+function changeVideoApiMode(event: Event) {
+  const mode = (event.target as HTMLSelectElement).value as 'local' | 'remote'
+  videoConfigDraft.value.mode = mode
+  if (mode === 'local') videoConfigDraft.value.baseUrl = 'http://127.0.0.1:8188'
+  else if (!videoConfigDraft.value.baseUrl.startsWith('https://')) videoConfigDraft.value.baseUrl = 'https://minimaxh3.lucasjiang.uk'
+}
+async function persistVideoConfig() {
+  videoConfigSaving.value = true
+  videoHealthError.value = ''
+  try {
+    videoConfig.value = await saveVideoAgentConfig({ baseUrl: videoConfigDraft.value.baseUrl, apiToken: videoConfigDraft.value.apiToken })
+    videoConfigDraft.value = { mode: videoConfig.value.baseUrl.startsWith('https://') ? 'remote' : 'local', baseUrl: videoConfig.value.baseUrl, apiToken: '' }
+    workspaceError.value = ''
+  } catch (error) { videoHealthError.value = `保存 H3 设置失败：${String(error)}` }
+  finally { videoConfigSaving.value = false }
+}
+async function testVideoConnection() {
+  videoHealthLoading.value = true
+  videoHealthError.value = ''
+  videoHealthStatus.value = ''
+  try {
+    videoConfig.value = await saveVideoAgentConfig({ baseUrl: videoConfigDraft.value.baseUrl, apiToken: videoConfigDraft.value.apiToken })
+    videoConfigDraft.value = { mode: videoConfig.value.baseUrl.startsWith('https://') ? 'remote' : 'local', baseUrl: videoConfig.value.baseUrl, apiToken: '' }
+    const result = await checkVideoApiHealth()
+    videoHealthStatus.value = `连接成功：${videoConfig.value.baseUrl}`
+    void result
+  } catch (error) { videoHealthError.value = String(error) }
+  finally { videoHealthLoading.value = false }
 }
 async function createChat() {
   try {
@@ -538,6 +581,22 @@ async function sendMessage() {
     workspaceError.value = '请先在模型菜单中添加并选择一个 AI 模型。'
     return
   }
+  if (agentMode.value === 'video') {
+    const selectedProvider = providers.value.find(item => item.name === selectedProviderName.value)
+    if (!selectedProvider || !isDeepSeekBaseUrl(selectedProvider.baseUrl) || !selectedProvider.hasApiKey) {
+      workspaceError.value = 'AI 视频模式需要已配置 API Key 的 DeepSeek 服务商。请在模型菜单中选择 DeepSeek。'
+      return
+    }
+    if (!videoConfig.value.baseUrl) {
+      workspaceError.value = '请先在“设置 → AI 视频模式”配置 H3 API 地址。'
+      return
+    }
+    if (videoConfigDraft.value.mode === 'remote' && !videoConfig.value.hasApiToken) {
+      workspaceError.value = '远程模式需要 Comfy API Proxy Token，请在“设置 → AI 视频模式”中填写并保存。'
+      activeView.value = 'settings'
+      return
+    }
+  }
   const chat = activeChat.value ?? await createChat()
   if (!chat) return
   const previousUsage = getSessionUsage(chat)
@@ -545,6 +604,7 @@ async function sendMessage() {
   if (chat.title === '新对话') chat.title = text.slice(0, 34)
   prompt.value = ''
   const assistant: Chat['messages'][number] = { id: crypto.randomUUID(), createdAt: new Date().toISOString(), role: 'assistant', content: '', reasoning: '', startedAtMs: Date.now(), toolStatus: '' }
+  assistant.videoPromptEligible = agentMode.value === 'video'
   chat.messages.push(assistant)
   const estimatedInputTokens = Math.max(1, Math.ceil(text.length * 0.65))
   assistant.inputTokens = estimatedInputTokens
@@ -559,7 +619,10 @@ async function sendMessage() {
   if (runtimeTimer) clearInterval(runtimeTimer)
   runtimeTimer = setInterval(() => { runtimeTick.value = Date.now() }, 250)
   try {
-    await startAgentRun(chat.id, text, selectedProviderName.value, selectedModel.value, (event: AgentEvent) => {
+    const agentPrompt = agentMode.value === 'video'
+      ? `【AI 短剧视频模式】请将用户的创意整理成一段可直接用于 MiniMax H3 的单镜头视频提示词，时长约 10 秒。提示词需描述角色外观、场景、连续动作、镜头运动、画面风格和声音/对白；若用户给的是长剧情，只聚焦一个最适合当前镜头的片段，不要一次输出多个分镜。只输出最终视频提示词，不加标题、解释或 Markdown。\n\n用户创意：\n${text}`
+      : text
+    await startAgentRun(chat.id, agentPrompt, selectedProviderName.value, selectedModel.value, (event: AgentEvent) => {
       if (event.type === 'run.started') assistant.startedAtMs = Date.now()
       if (event.type === 'run.started') assistant.toolStatus = '正在思考…'
       if (event.type === 'reasoning.delta') {
@@ -616,6 +679,114 @@ async function sendMessage() {
     assistant.elapsedMilliseconds ??= Date.now() - (assistant.startedAtMs ?? Date.now())
   }
   finally { isRunning.value = false; runPaused.value = false; runStopping.value = false; if (runtimeTimer) clearInterval(runtimeTimer); runtimeTimer = undefined; if (approvalRequest.value) approvalRequest.value = null }
+}
+async function setAgentMode(mode: 'daily' | 'video') {
+  if (mode === 'video') {
+    const current = providers.value.find(item => item.name === selectedProviderName.value)
+    const deepSeek = providers.value.find(item => isDeepSeekBaseUrl(item.baseUrl) && item.hasApiKey && item.models.length > 0)
+    if ((!current || !isDeepSeekBaseUrl(current.baseUrl) || !current.hasApiKey) && deepSeek)
+      selectModel(deepSeek.name, deepSeek.models[0])
+  }
+  agentMode.value = mode
+}
+async function generateVideoFromMessage(message: Chat['messages'][number]) {
+  if (!message.content.trim() || message.videoJobStatus?.startsWith('正在生成')) return
+  const routeLabel = videoConfigDraft.value.mode === 'remote' ? '远程' : '本机'
+  message.videoJobStatus = `正在提交${routeLabel} H3 任务…`
+  message.videoJobDetail = ''
+  message.videoJobProgress = undefined
+  message.videoJobProgressLabel = ''
+  message.videoJobCancelling = false
+  try {
+    const job = await submitVideoJob(message.content)
+    const nestedJob = job.job && typeof job.job === 'object' ? job.job as Record<string, unknown> : job.data && typeof job.data === 'object' ? job.data as Record<string, unknown> : {}
+    const jobId = [job.prompt_id, job.job_id, job.task_id, job.id, nestedJob.prompt_id, nestedJob.job_id, nestedJob.task_id, nestedJob.id].find(value => typeof value === 'string') as string | undefined ?? ''
+    if (!jobId) throw new Error(`H3 未返回任务 ID：${JSON.stringify(job)}`)
+    message.videoJobId = jobId
+    message.videoJobStatus = `正在生成${routeLabel}视频 · ${routeLabel}端已创建任务 ${jobId} · 正在连接实时进度…`
+    const startedAt = Date.now()
+    const controller = new AbortController()
+    videoJobControllers.set(jobId, controller)
+    let terminal = false
+    const handleSnapshot = (result: Record<string, unknown>, eventName = 'status') => {
+      const nested = result.task && typeof result.task === 'object' ? result.task as Record<string, unknown> : result.job && typeof result.job === 'object' ? result.job as Record<string, unknown> : {}
+      const statusObject = result.status && typeof result.status === 'object' ? result.status as Record<string, unknown> : nested.status && typeof nested.status === 'object' ? nested.status as Record<string, unknown> : null
+      const statusValue = typeof result.status === 'string' ? result.status : typeof nested.status === 'string' ? nested.status : typeof statusObject?.status === 'string' ? statusObject.status : ''
+      const state = (typeof statusObject?.status_str === 'string' ? statusObject.status_str : statusValue).toLowerCase()
+      const progress = eventName === 'progress' ? result : result.progress && typeof result.progress === 'object' ? result.progress as Record<string, unknown> : nested.progress && typeof nested.progress === 'object' ? nested.progress as Record<string, unknown> : null
+      const value = typeof progress?.value === 'number' ? progress.value : null
+      const max = typeof progress?.max === 'number' ? progress.max : null
+      if (value !== null && max !== null && max > 0) {
+        message.videoJobProgress = Math.max(0, Math.min(100, Math.round(value / max * 100)))
+        const node = typeof progress?.node_id === 'string' ? `节点 ${progress.node_id} · ` : ''
+        message.videoJobProgressLabel = `${node}${value}/${max} (${message.videoJobProgress}%)`
+      } else if (value !== null) {
+        message.videoJobProgress = Math.max(0, Math.min(100, Math.round(value <= 1 ? value * 100 : value)))
+        message.videoJobProgressLabel = `当前节点 ${message.videoJobProgress}%`
+      }
+      const queuePosition = typeof result.queue_position === 'number' ? result.queue_position : typeof nested.queue_position === 'number' ? nested.queue_position : null
+      if (statusObject?.completed === true || ['success', 'succeeded', 'completed'].includes(state)) {
+        message.videoJobDetail = JSON.stringify(result.outputs ?? nested.outputs ?? result, null, 2)
+        message.videoJobStatus = `${routeLabel}生成完成 · 任务 ${jobId}`
+        message.videoJobProgress = 100
+        message.videoJobProgressLabel = '生成完成'
+        terminal = true
+      }
+      else if (['error', 'failed', 'cancelled', 'canceled', 'expired'].includes(state) || result.error || nested.error) {
+        message.videoJobDetail = JSON.stringify(result, null, 2)
+        message.videoJobStatus = ['cancelled', 'canceled'].includes(state) ? `${routeLabel}视频生成已终止 · 任务 ${jobId}` : `${routeLabel}生成失败 · 任务 ${jobId}`
+        terminal = true
+      }
+      else if (['queued', 'pending'].includes(state)) {
+        message.videoJobStatus = `正在生成${routeLabel}视频 · 已创建，排队中${queuePosition !== null ? `（前面还有 ${queuePosition} 个任务）` : ''} · 任务 ${jobId}`
+      } else if (['canceling', 'cancelling'].includes(state) || message.videoJobCancelling) {
+        message.videoJobStatus = `正在生成${routeLabel}视频 · 终止请求已发送，等待远程确认 · 任务 ${jobId}`
+      } else if (['running', 'processing'].includes(state) || eventName === 'progress') {
+        message.videoJobStatus = `正在生成${routeLabel}视频 · ${routeLabel}生成中 · 任务 ${jobId} · 已用时 ${Math.floor((Date.now() - startedAt) / 60000)} 分钟`
+      }
+    }
+    const handleEvent = ({ event, data }: VideoJobEvent) => handleSnapshot(data, event)
+    if (routeLabel === '远程') {
+      try { await streamVideoJobEvents(jobId, handleEvent, controller.signal) }
+      catch {
+        if (!controller.signal.aborted && !terminal)
+          message.videoJobStatus = `正在生成${routeLabel}视频 · 实时进度不可用，改用状态轮询 · 任务 ${jobId}`
+      }
+    }
+    for (let attempt = 0; attempt < 360 && !terminal; attempt++) {
+      await new Promise(resolve => setTimeout(resolve, message.videoJobCancelling ? 1500 : 5000))
+      handleSnapshot(await getVideoJob(jobId))
+      if (!terminal && !message.videoJobProgressLabel)
+        message.videoJobStatus = `正在生成${routeLabel}视频 · 已创建任务，等待进度更新 · 任务 ${jobId} · 已用时 ${Math.floor((Date.now() - startedAt) / 60000)} 分钟`
+    }
+    if (!terminal) message.videoJobStatus = `正在生成${routeLabel}视频 · 查询超时，任务仍运行 · ${jobId}`
+    controller.abort()
+    videoJobControllers.delete(jobId)
+  } catch (error) {
+    message.videoJobStatus = `${routeLabel} H3 生成失败：${String(error)}`
+  }
+}
+async function stopVideoGeneration(message: Chat['messages'][number]) {
+  const jobId = message.videoJobId
+  if (!jobId || message.videoJobCancelling || !message.videoJobStatus?.startsWith('正在生成')) return
+  const routeLabel = videoConfigDraft.value.mode === 'remote' ? '远程' : '本机'
+  message.videoJobCancelling = true
+  message.videoJobStatus = `正在生成${routeLabel}视频 · 正在发送终止请求… · 任务 ${jobId}`
+  try {
+    const result = await cancelVideoJob(jobId)
+    const state = typeof result.status === 'string' ? result.status.toLowerCase() : ''
+    if (['cancelled', 'canceled', 'completed', 'failed'].includes(state)) {
+      message.videoJobStatus = ['cancelled', 'canceled'].includes(state) ? `${routeLabel}视频生成已终止 · 任务 ${jobId}` : `${routeLabel}任务已结束 · ${state}`
+      message.videoJobCancelling = false
+      videoJobControllers.get(jobId)?.abort()
+      videoJobControllers.delete(jobId)
+    } else {
+      message.videoJobStatus = `正在生成${routeLabel}视频 · 终止请求已发送，等待远程确认 · 任务 ${jobId}`
+    }
+  } catch (error) {
+    message.videoJobCancelling = false
+    message.videoJobStatus = `正在生成${routeLabel}视频 · 终止失败：${String(error)} · 任务 ${jobId}`
+  }
 }
 function selectModel(providerName: string, model: string) {
   selectedProviderName.value = providerName
@@ -724,6 +895,18 @@ function containsUnsupportedToolProtocol(content: string) {
           <details v-if="message.role === 'assistant' && message.reasoning && settings.showReasoning" class="reasoning-panel"><summary>思考过程</summary><div>{{ message.reasoning }}</div></details>
           <div v-if="message.role === 'assistant'" class="message-content markdown-content" v-html="renderMarkdown(message.content)"></div>
           <div v-if="message.role === 'assistant' && (message.startedAtMs || message.toolStatus || message.elapsedMilliseconds !== undefined)" class="assistant-run-meta"><span v-if="message.toolStatus">{{ message.toolStatus }}</span><span>{{ message.elapsedMilliseconds === undefined ? '已处理' : '已用时' }} {{ formatDuration(messageDuration(message)) }}</span></div>
+          <div v-if="message.role === 'assistant' && message.videoPromptEligible" class="video-job-panel">
+            <button class="video-generate-button" :disabled="isRunning || message.videoJobStatus?.startsWith('正在提交') || message.videoJobStatus?.startsWith('正在生成')" @click="generateVideoFromMessage(message)">{{ message.videoJobId ? '重新生成这段视频' : '生成这段 10 秒视频' }}</button>
+            <div v-if="message.videoJobId && message.videoJobStatus?.startsWith('正在生成')" class="video-job-live-row">
+              <div class="video-job-progress" :class="{ indeterminate: message.videoJobProgress === undefined }" role="progressbar" :aria-valuenow="message.videoJobProgress" aria-valuemin="0" aria-valuemax="100">
+                <span :style="message.videoJobProgress === undefined ? {} : { width: `${message.videoJobProgress}%` }"></span>
+              </div>
+              <span class="video-job-progress-label">{{ message.videoJobProgressLabel || '等待远程进度事件…' }}</span>
+              <button class="video-cancel-button" :disabled="message.videoJobCancelling" @click="stopVideoGeneration(message)">{{ message.videoJobCancelling ? '正在终止…' : '终止生成' }}</button>
+            </div>
+            <span v-if="message.videoJobStatus" class="video-job-status">{{ message.videoJobStatus }}</span>
+            <details v-if="message.videoJobDetail" class="video-job-detail"><summary>查看任务输出信息</summary><pre>{{ message.videoJobDetail }}</pre></details>
+          </div>
           <div v-if="message.role !== 'assistant'" class="message-content">{{ message.content }}</div>
           <div v-if="message.role === 'assistant' && message.gitDiff !== undefined" class="git-review">
             <button class="git-review-trigger" @click="message.showGitDiff = !message.showGitDiff">{{ message.gitDiff ? '查看本轮代码改动' : '本轮没有 Git 改动' }}<IconChevronDown :class="{ open: message.showGitDiff }" :size="14" /></button>
@@ -735,8 +918,12 @@ function containsUnsupportedToolProtocol(content: string) {
       <button v-if="activeView === 'chat' && activeChat && showScrollToBottom" class="scroll-bottom-button" aria-label="滚动到对话底部" title="滚动到对话底部" @click="scrollConversationToBottom"><IconChevronDown :size="20" :stroke-width="2" /></button>
       <section v-if="activeView === 'chat'" class="composer-wrap">
         <div class="composer">
-          <textarea v-model="prompt" placeholder="随心输入" @keydown.enter.exact.prevent="!isRunning && sendMessage()" />
+          <textarea v-model="prompt" :placeholder="agentMode === 'video' ? '描述一个 10 秒短剧镜头或视频创意…' : '随心输入'" @keydown.enter.exact.prevent="!isRunning && sendMessage()" />
           <div class="composer-footer"><div class="composer-left">
+            <div class="mode-switch" role="group" aria-label="Agent 模式">
+              <button :class="{ selected: agentMode === 'daily' }" :disabled="isRunning" @click="setAgentMode('daily')">日常</button>
+              <button :class="{ selected: agentMode === 'video' }" :disabled="isRunning" @click="setAgentMode('video')">AI 视频</button>
+            </div>
             <div class="workspace-picker">
               <button class="plus workspace-plus" aria-label="选择工作区" title="选择工作区" :aria-expanded="workspaceMenuOpen" @click="workspaceMenuOpen = !workspaceMenuOpen; permissionMenuOpen = false">＋</button>
               <div v-if="workspaceMenuOpen" class="execution-menu workspace-menu">
@@ -763,7 +950,8 @@ function containsUnsupportedToolProtocol(content: string) {
               <button class="model-button" :title="selectedProviderName" @click="showModelMenu = !showModelMenu">{{ modelPickerLabel }}<IconChevronDown class="model-chevron" :class="{ open: showModelMenu }" :size="14" :stroke-width="1.8" /></button>
               <div v-if="showModelMenu" class="model-menu">
                 <div v-if="providers.length === 0" class="model-menu-empty">还没有添加 AI 服务商</div>
-                <section v-for="provider in providers" :key="provider.name" class="model-provider-group">
+                <div v-else-if="agentMode === 'video' && !providers.some(item => isDeepSeekBaseUrl(item.baseUrl) && item.hasApiKey)" class="model-menu-empty">请先添加 DeepSeek 服务商并保存 API Key</div>
+                <section v-for="provider in providers.filter(item => agentMode !== 'video' || (isDeepSeekBaseUrl(item.baseUrl) && item.hasApiKey))" :key="provider.name" class="model-provider-group">
                   <div class="model-provider-heading"><span>{{ provider.name }}</span><button class="provider-config-button" :title="`配置 ${provider.name}`" @click="configureProvider(provider.name)"><IconSettings :size="14" /></button></div>
                   <button v-for="model in provider.models" :key="model" class="model-option" :class="{ selected: selectedProviderName === provider.name && selectedModel === model }" @click="selectModel(provider.name, model)">{{ model }}</button>
                 </section>
@@ -789,6 +977,17 @@ function containsUnsupportedToolProtocol(content: string) {
       <section v-if="activeView === 'settings'" class="management-page settings-page">
         <div class="management-heading"><div><h1>设置</h1><p>本地偏好、运行安全与工作区校验参数。</p></div><button class="save-button" :disabled="settingsSaving" @click="persistSettings">{{ settingsSaving ? '保存中…' : '保存设置' }}</button></div>
         <div class="settings-group"><h2>显示</h2><label class="setting-row"><span><strong>显示思考过程</strong><small>仅展示模型接口实际返回的 reasoning 字段。</small></span><input v-model="settings.showReasoning" type="checkbox" /></label><label class="setting-row"><span><strong>显示 Token 用量</strong><small>实时估算或显示服务商返回的用量。</small></span><input v-model="settings.showTokenUsage" type="checkbox" /></label></div>
+        <div class="settings-group video-settings-group">
+          <h2>AI 视频模式</h2>
+          <p class="settings-note">选择本机 ComfyUI，或通过 VPS 上的 Comfy API Proxy 远程调用本机 H3。工作流和节点映射已内置，不用选择 JSON。剧本提示词仍使用已配置的 DeepSeek 服务商。</p>
+          <label>H3 调用方式<select :value="videoConfigDraft.mode" @change="changeVideoApiMode"><option value="local">本机（ComfyUI）</option><option value="remote">远程（VPS / Cloudflare）</option></select></label>
+          <label>API 地址<input v-model="videoConfigDraft.baseUrl" type="url" :placeholder="videoConfigDraft.mode === 'remote' ? 'https://minimaxh3.lucasjiang.uk' : 'http://127.0.0.1:8188'" /></label>
+          <label v-if="videoConfigDraft.mode === 'remote'">Comfy API Proxy Token<input v-model="videoConfigDraft.apiToken" type="password" :placeholder="videoConfig.hasApiToken ? 'Token 已保存；留空保持不变' : '粘贴 VPS Proxy Token'" autocomplete="new-password" /></label>
+          <p v-if="videoConfigDraft.mode === 'remote'" class="secret-note">远程请求会从 Lucas Agent 后端发送到你的 VPS，再转发到运行 H3 的电脑。Token 加密保存在本机；请保持反向代理和本机 API Proxy 运行。</p>
+          <p v-else class="secret-note">本机调用不需要 Token。ComfyUI 需运行在本机 8188 端口，视频在本机 GPU 上生成。</p>
+          <p v-if="videoHealthStatus" class="video-health-success">{{ videoHealthStatus }}</p><p v-if="videoHealthError" class="video-health-error">{{ videoHealthError }}</p>
+          <div class="dialog-actions"><button type="button" class="cancel-button" :disabled="videoHealthLoading" @click="testVideoConnection">{{ videoHealthLoading ? '连接中…' : '保存并测试连接' }}</button><button type="button" class="save-button" :disabled="videoConfigSaving" @click="persistVideoConfig">{{ videoConfigSaving ? '保存中…' : '保存设置' }}</button></div>
+        </div>
         <div class="settings-group"><h2>Harness Engineering 与 Loop Engineering</h2><p class="settings-note">Agent 根据任务自行选择工作区文件、工具和验证步骤，并把真实工具结果带回模型继续处理。一般任务最多 9 轮工具往返；代码修改后会要求模型选择验证命令，失败时可修复并重试。终端命令使用当前系统用户权限，工作目录不是操作系统级沙箱。</p><label class="setting-row"><span><strong>新对话默认请求批准</strong><small>设为默认安全模式；每个对话仍可在输入框权限菜单中单独切换。</small></span><input v-model="settings.requireToolApproval" type="checkbox" /></label></div>
         <div class="local-note">此应用为纯本地模式：没有账号登录或云端同步。SQLite 数据库位于当前系统用户的应用数据目录。</div>
       </section>

@@ -20,12 +20,15 @@ builder.Services.AddCors(options =>
 });
 
 builder.Services.AddScoped<AgentBackend.Services.IAgentService, AgentBackend.Services.AgentService>();
+builder.Services.AddScoped<AgentBackend.Services.VideoAgentService>();
 builder.Services.AddSingleton<AgentBackend.Services.ToolApprovalBroker>();
 builder.Services.AddSingleton<AgentBackend.Services.WorkspaceToolExecutor>();
 builder.Services.AddSingleton<AgentBackend.Services.AgentRunRegistry>();
 builder.Services.AddSingleton<AgentBackend.Services.GitChangeTracker>();
 builder.Services.AddSingleton<AgentBackend.Repositories.IAgentRepository, AgentBackend.Repositories.SqliteAgentRepository>();
 builder.Services.AddHttpClient("ModelProvider", client => client.Timeout = TimeSpan.FromMinutes(5));
+builder.Services.AddHttpClient("VideoApi", client => client.Timeout = TimeSpan.FromMinutes(2));
+builder.Services.AddHttpClient("VideoEvents", client => client.Timeout = Timeout.InfiniteTimeSpan);
 
 // Learn more about configuring Swagger/OpenAPI at https://aka.ms/aspnetcore/swashbuckle
 builder.Services.AddEndpointsApiExplorer();

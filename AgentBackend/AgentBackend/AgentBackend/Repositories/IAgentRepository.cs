@@ -50,6 +50,10 @@ public interface IAgentRepository
     Task<AgentSettings> GetSettingsAsync(CancellationToken cancellationToken = default);
     /// <summary>保存本地界面、Harness 与 Loop 设置。</summary>
     Task SaveSettingsAsync(AgentSettings settings, CancellationToken cancellationToken = default);
+    /// <summary>读取本地 H3 配置，其中令牌为密文。</summary>
+    Task<StoredVideoAgentConfig?> GetVideoAgentConfigAsync(CancellationToken cancellationToken = default);
+    /// <summary>保存本地 H3 配置。</summary>
+    Task SaveVideoAgentConfigAsync(StoredVideoAgentConfig config, CancellationToken cancellationToken = default);
     /// <summary>创建会话并可选保存初始提示。</summary>
     Task<AgentSession> CreateSessionAsync(
         string? initialPrompt,

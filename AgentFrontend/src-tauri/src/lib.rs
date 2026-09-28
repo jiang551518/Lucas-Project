@@ -1,5 +1,6 @@
 use std::sync::Mutex;
 use std::net::TcpListener;
+use std::{env, fs, path::PathBuf};
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{Manager, RunEvent, WindowEvent};
@@ -63,6 +64,7 @@ fn start_backend(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>>
     if let Some(endpoint) = app.try_state::<BackendEndpoint>() {
         *endpoint.0.lock().map_err(|_| "backend URL state is poisoned")? = backend_url.clone();
     }
+    publish_backend_endpoint(&backend_url);
     let (mut events, child) = app
         .shell()
         .sidecar("lucas-agent-backend")?
@@ -82,6 +84,15 @@ fn start_backend(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>>
 
     app.manage(BackendProcess(Mutex::new(Some(child))));
     Ok(())
+}
+
+/// Publishes the packaged backend's random loopback port for the optional Codex MCP bridge.
+fn publish_backend_endpoint(backend_url: &str) {
+    let Ok(local_app_data) = env::var("LOCALAPPDATA") else { return; };
+    let directory = PathBuf::from(local_app_data).join("LucasAgent");
+    if fs::create_dir_all(&directory).is_ok() {
+        let _ = fs::write(directory.join("backend-endpoint.txt"), backend_url);
+    }
 }
 
 /// Creates a tray icon with show and quit actions for the desktop application.

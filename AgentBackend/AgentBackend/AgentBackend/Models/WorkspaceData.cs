@@ -8,7 +8,32 @@ public sealed class WorkspaceData
     public List<AgentSkill> Skills { get; set; } = [];
     public List<MemoryEntry> Memories { get; set; } = [];
     public AgentSettings Settings { get; set; } = new();
+    public StoredVideoAgentConfig? VideoAgentConfig { get; set; }
 }
+
+/// <summary>本机 ComfyUI HTTP API 地址；旧版字段保留以兼容已有数据库。</summary>
+public sealed class StoredVideoAgentConfig
+{
+    public string BaseUrl { get; set; } = "http://127.0.0.1:8188";
+    public string WorkflowPath { get; set; } = string.Empty;
+    public string PromptNodeId { get; set; } = string.Empty;
+    public string PromptInputName { get; set; } = "prompt";
+    public string ImageNodeId { get; set; } = string.Empty;
+    public string ImageInputName { get; set; } = "image";
+    public string ProtectedApiToken { get; set; } = string.Empty;
+}
+
+/// <summary>返回前端的本机 H3 API 地址摘要。</summary>
+public sealed record VideoAgentConfigSummary(string BaseUrl, bool HasApiToken);
+
+/// <summary>保存本机 ComfyUI HTTP API 地址。</summary>
+public sealed record SaveVideoAgentConfigRequest(string BaseUrl, string? ApiToken);
+
+/// <summary>从 API 工作流识别出的可配置文本或图片输入。</summary>
+public sealed record WorkflowInputCandidate(string NodeId, string NodeType, string InputName, string Label, int MatchScore);
+
+/// <summary>本地工作流检查结果与自动识别的输入节点。</summary>
+public sealed record WorkflowInspectionResult(bool IsApiWorkflow, WorkflowInputCandidate? PromptInput, WorkflowInputCandidate? ImageInput, IReadOnlyList<WorkflowInputCandidate> PromptCandidates, IReadOnlyList<WorkflowInputCandidate> ImageCandidates, string Message);
 
 /// <summary>本地可管理并可注入模型上下文的技能条目。</summary>
 public sealed class AgentSkill

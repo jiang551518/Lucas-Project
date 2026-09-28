@@ -15,6 +15,15 @@ Lucas Agent 是一个纯本地运行的桌面 AI Agent 原型，目标是让用�
 - **代码变更预览**：显示一轮运行前后的 Git diff，便于检查 Agent 对工作区所做的更改。
 - **Harness / 工具循环**：模型可以根据任务选择工具，并将工具结果带回后续模型请求；代码修改后会要求模型自行选择验证命令，失败时可修复并重试，结束时明确报告未验证或失败状态。工具输出有长度上限，避免异常输出耗尽内存。
 - **技能、记忆和设置**：管理本地技能和记忆；设置思考过程、Token 用量显示及新会话默认审批偏好。
+- **AI 视频模式**：用 DeepSeek 整理单镜头提示词，再通过本机 ComfyUI HTTP API 或 VPS 上的 Comfy API Proxy 调用 MiniMax H3；API 工作流已内置，界面无需选择 JSON 或填写节点 ID。
+- **视频任务进度与终止**：Lucas Agent 显示任务状态和进度；远程 H3 通过事件流接收实时状态，本机任务通过状态轮询更新。生成过程中可手动终止任务。
+- **Codex MCP**：本地 stdio MCP 桥接器可让 Codex 查看 Lucas Agent 状态与会话、调用已配置模型、提交 H3 视频任务并查询结果。需要先启动 Lucas Agent；生成视频时还需确认本机 ComfyUI 或远程 H3 服务已启动。
+
+## 最近更新（2026-09-28）
+
+- 视频生成卡片会显示排队、运行、完成、失败或终止状态；远程 H3 优先使用事件流推送进度，本机模式使用状态轮询。进度值反映 H3/ComfyUI 当前节点的进度，不代表整段视频的精确总进度。
+- 生成中的任务提供“终止生成”按钮。后端新增任务进度事件流和取消接口，并根据本机/远程模式转发给 ComfyUI 或 Comfy API Proxy。
+- MCP 说明补充了 Codex 注册步骤、可用工具、典型调用流程及当前能力边界。MCP 工具本身可查询任务，但取消任务目前请在 Lucas Agent 界面操作。
 
 ### 安全说明
 
@@ -32,7 +41,38 @@ ASP.NET Core
   ├─ Controller → IAgentService → AgentService
   └─ AgentService → IAgentRepository → SqliteAgentRepository
 SQLite：项目、会话、消息、模型服务商、技能、记忆和设置
+Codex stdio MCP：经本机 REST / SignalR 调用 Lucas Agent
 ```
+
+### Codex MCP
+
+MCP 是运行在本机的 stdio 桥接器，不需要单独部署 MCP 服务。先启动 Lucas Agent；如果要提交 H3 任务，再在 Lucas Agent 的 AI 视频设置中配置 DeepSeek 与本机 ComfyUI 或远程 H3 API。然后在 PowerShell 注册：
+
+```powershell
+Set-Location "D:\Lucas Project\AgentFrontend"
+npm install
+codex mcp add lucas-agent -- node "D:\Lucas Project\AgentFrontend\mcp-server\index.mjs"
+codex mcp list
+```
+
+然后重启 Codex。在 Codex 里先调用 `lucas_status` 检查连接，再按需调用：
+
+| MCP 工具 | 用途 |
+| --- | --- |
+| `lucas_status` | 检查 Lucas Agent 后端、已配置模型与 H3 连接 |
+| `lucas_list_sessions` | 列出本地会话 |
+| `lucas_run_agent` | 调用已配置模型；`mode: "video"` 时让 DeepSeek 写一个约 10 秒的 H3 镜头提示词，**不会提交视频任务** |
+| `lucas_generate_video` | 将提示词提交到 Lucas Agent 当前配置的本机或远程 H3，返回任务 ID |
+| `lucas_get_video_job` | 根据任务 ID 查询状态和输出 |
+
+调用示例：
+
+1. 对 Codex 说：“调用 `lucas_status`，检查 Lucas Agent 和 H3 是否在线。”
+2. 对 Codex 说：“用 `lucas_run_agent` 的 `video` 模式，把‘秦始皇走出神秘城门’改写成一段 10 秒 H3 提示词。”
+3. 检查提示词后，对 Codex 说：“用 `lucas_generate_video` 提交这段提示词，并告诉我任务 ID。”这会实际提交视频生成任务。
+4. 对 Codex 说：“用 `lucas_get_video_job` 查询任务 ID 为 `<任务ID>` 的进度和结果。”
+
+当前 MCP 支持提交和查询任务；任务的实时进度展示与手动终止请在 Lucas Agent 界面完成。打包版 Lucas Agent 会在 `%LOCALAPPDATA%\LucasAgent\backend-endpoint.txt` 发布动态后端地址；开发模式默认使用 `http://127.0.0.1:5008`。更多说明见 [AgentFrontend/mcp-server/README.md](AgentFrontend/mcp-server/README.md)。
 
 ### Token 用量的会话范围
 
@@ -163,6 +203,17 @@ GitHub Actions 位于 `.github/workflows/desktop.yml`：推送或创建 Pull Req
 | `GET` / `PUT` | `/api/memories` | 读取或保存记忆 |
 | `DELETE` | `/api/memories/{id}` | 删除记忆 |
 | `GET` / `PUT` | `/api/settings` | 读取或保存设置 |
+
+### AI 视频任务
+
+| 方法 | 路径 | 用途 |
+| --- | --- | --- |
+| `GET` | `/api/video/config` | 读取视频模式配置摘要（不返回 H3 Token） |
+| `GET` | `/api/video/health` | 检查当前 H3 端点 |
+| `POST` | `/api/video/jobs` | 提交内置工作流视频任务，返回任务 ID |
+| `GET` | `/api/video/jobs/{jobId}` | 查询任务状态与输出 |
+| `GET` | `/api/video/jobs/{jobId}/events` | 转发远程 H3 实时进度事件流 |
+| `POST` | `/api/video/jobs/{jobId}/cancel` | 请求取消本机或远程 H3 任务 |
 
 Agent 对话通过 SignalR Hub `/hubs/agent` 启动，并以统一事件传递回答、思考、工具状态、审批请求、Token 用量、耗时和 Git diff。主要事件包括 `run.started`、`reasoning.delta`、`message.delta`、`tool.started`、`tool.approval_required`、`usage.update`、`run.git_diff` 和 `run.completed`。
 

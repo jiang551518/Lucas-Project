@@ -15,4 +15,8 @@
     <InternalsVisibleTo Include="AgentBackend.Tests" />
   </ItemGroup>
 
+  <ItemGroup>
+    <EmbeddedResource Include="workflows\minimax-h3-t2v-api.json" />
+  </ItemGroup>
+
 </Project>
